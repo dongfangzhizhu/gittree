@@ -20,7 +20,7 @@ import { buildBranchGeometry, visibleRingCount } from "./branch-geometry";
 const LEAF_COLORS = [
   "#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8",
   "#F7DC6F", "#BB8FCE", "#85C1E2", "#F8B88B", "#82E0AA",
-  "#F1948A", "#D7DBDD", "#9B59B6",
+  "#F1948A", "#7FA88A", "#9B59B6",
 ];
 const WITHERED_COLOR = "#8d6e63";
 const TRUNK_COLOR = 0x2f5d3f;
@@ -37,8 +37,8 @@ const FALL_DURATION = 0.06;
  * 叶/果的基础半径只有 0.3–1.6 单位，直接渲染不足 1px。
  * 放大到肉眼可见、可点击的尺寸（直径约 8–26 单位）。
  */
-const LEAF_SCALE = 11;
-const FRUIT_SCALE = 7;
+const LEAF_SCALE = 8;
+const FRUIT_SCALE = 6;
 
 export type ViewName = "overview" | "side" | "top" | "root";
 
@@ -171,10 +171,10 @@ export class TreeRenderer {
   }
 
   private setupLights(): void {
-    const hemi = new THREE.HemisphereLight(0x9fb4ff, 0x0a0e27, 0.9);
+    const hemi = new THREE.HemisphereLight(0x9fb4ff, 0x0a0e27, 0.62);
     this.scene.add(hemi);
 
-    const sun = new THREE.DirectionalLight(0xfff2d8, 1.4);
+    const sun = new THREE.DirectionalLight(0xfff2d8, 1.0);
     sun.position.set(700, 1400, 500);
     this.scene.add(sun);
 
@@ -344,10 +344,10 @@ export class TreeRenderer {
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     const mat = new THREE.PointsMaterial({
       color: 0xffffff,
-      size: 2.2,
+      size: 1.8,
       sizeAttenuation: false,
       transparent: true,
-      opacity: 0.75,
+      opacity: 0.5,
       fog: false,
     });
     this.stars = new THREE.Points(geo, mat);
@@ -425,7 +425,7 @@ export class TreeRenderer {
     for (const [shape, items] of byShape) {
       const geo = leafGeometry(shape);
       if (!geo) continue;
-      const mat = new THREE.MeshStandardMaterial({ roughness: 0.65, metalness: 0 });
+      const mat = new THREE.MeshStandardMaterial({ roughness: 0.88, metalness: 0 });
       const mesh = new THREE.InstancedMesh(geo, mat, items.length);
       mesh.frustumCulled = false;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);

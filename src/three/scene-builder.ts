@@ -28,10 +28,12 @@ const BRANCH_DEPTH_SHRINK = 0.70;
 const BRANCH_DEPTH_RISE_DEG = 12;
 /** 枝条从基部到梢部额外上拱的度数 */
 const BRANCH_TIP_ARCH_DEG = 16;
+/** 一级枝条的最小伸展长度（世界单位），保证短 lane 也看得见 */
+const MIN_BRANCH_EXTENT = 90;
 const TRUNK_SWAY_DEG = 7; // 主干每段偏摆 ±7°
 const BRANCH_SWAY_DEG = 5;
 const MIN_BRANCH_COMMITS = 2; // 少于此数的支线不单独分枝
-const THICKNESS = { base: 1.8, min: 1.5, max: 22, basalFlare: 1.5, flareDecay: 55 };
+const THICKNESS = { base: 2.2, min: 1.5, max: 30, basalFlare: 1.1, flareDecay: 50 };
 
 /** 叶子颜色索引 12 = 紫色（spec:/hook: 提交） */
 export const LEAF_COLOR_KIRO = 12;
@@ -157,10 +159,16 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     const segLen = isTrunk
       ? clamp(MAX_RISE / laneCommits.length, TRUNK_SEG_LEN.min, TRUNK_SEG_LEN.max)
       : clamp(
-          (MAX_RISE * 0.75 * Math.pow(BRANCH_DEPTH_SHRINK, depth)) / laneCommits.length,
+          MAX_RISE * 0.75 * Math.pow(BRANCH_DEPTH_SHRINK, depth) / laneCommits.length,
           BRANCH_SEG_LEN.min,
           BRANCH_SEG_LEN.max
         );
+    // 分支很短的 lane（合并产生的大量 1–3 提交小枝）默认只有几单位长，肉眼看等于不存在；
+    // 给一个随层级衰减的最小伸展长度，小枝也长成可见的细枝，树冠才有层次。
+    const minBranchLen = MIN_BRANCH_EXTENT * Math.pow(BRANCH_DEPTH_SHRINK, depth);
+    const branchSegLen = isTrunk
+      ? segLen
+      : Math.max(segLen, minBranchLen / Math.max(1, laneCommits.length));
 
     // 初始方向：主干竖直向上；支线由仰角 + 方位角确定
     let dir: Vec3 = [0, 1, 0];
@@ -214,7 +222,7 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
       }
 
       const p0 = p;
-      const p1 = vAdd(p0, vScale(dir, segLen));
+      const p1 = vAdd(p0, vScale(dir, branchSegLen));
 
       const globalIdx = commitIndex.get(commit.id) ?? i;
       const t0 = tOf(globalIdx);

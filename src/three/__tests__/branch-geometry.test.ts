@@ -5,7 +5,7 @@
 
 import { describe, it, expect } from "vitest";
 import * as THREE from "three";
-import { buildBranchGeometry, visibleRingCount } from "../branch-geometry";
+import { buildBranchGeometry, visibleRingCount, RADIAL_SEGMENTS } from "../branch-geometry";
 import { SceneBranch } from "../scene-types";
 
 /** 一条竖直向上的直枝 */
@@ -60,7 +60,7 @@ describe("buildBranchGeometry", () => {
     const branch = straightBranch(3);
     const { geometry, ringCount } = buildBranchGeometry(branch);
     const pos = geometry.getAttribute("position") as THREE.BufferAttribute;
-    const radial = 8;
+    const radial = RADIAL_SEGMENTS;
     // 直枝：环上顶点到轴线的距离 = 该环半径
     const radii: number[] = [];
     for (let ring = 0; ring < ringCount; ring++) {

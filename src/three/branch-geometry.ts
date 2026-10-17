@@ -15,9 +15,9 @@ import * as THREE from "three";
 import { SceneBranch } from "./scene-types";
 
 /** 每段折线采样环数（越大越平滑） */
-const RINGS_PER_SEGMENT = 6;
-/** 每环径向分段数 */
-const RADIAL_SEGMENTS = 8;
+export const RINGS_PER_SEGMENT = 6;
+/** 每环径向分段数（测试按此步长定位环上顶点） */
+export const RADIAL_SEGMENTS = 12;
 
 export interface BranchGeometryResult {
   geometry: THREE.BufferGeometry;
