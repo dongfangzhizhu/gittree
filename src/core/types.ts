@@ -91,59 +91,6 @@ export interface GrowthModel {
   metadata: { truncated: boolean; estimatedTotal?: number; samplingRate: number; droppedTags: number };
 }
 
-/** 树的几何信息 */
-export interface TreeSegment {
-  id: string;
-  commitId: string;
-  laneId: number;
-  kind: "trunk" | "branch" | "graft";
-  p0: [number, number];
-  c: [number, number];
-  p1: [number, number];
-  w0: number;
-  w1: number;
-  birth: [number, number];
-}
-
-export interface TreeLeaf {
-  id: string;
-  commitId: string;
-  pos: [number, number];
-  angle: number;
-  size: number;
-  shape: string;
-  colorIndex: number;
-  birth: number;
-  fallAt?: number;
-}
-
-export interface TreeFlower {
-  id: string;
-  tag: string;
-  pos: [number, number];
-  size: number;
-  birth: number;
-  kind: "normal" | "major" | "spec";
-}
-
-export interface TreeChapter {
-  title: string;
-  season: string;
-  t0: number;
-  t1: number;
-  dateRange: [number, number];
-}
-
-export interface TreeGeometry {
-  width: number;
-  height: number;
-  segments: TreeSegment[];
-  leaves: TreeLeaf[];
-  flowers: TreeFlower[];
-  chapters: TreeChapter[];
-  timeMap: Array<[number, number]>;
-}
-
 /** 原始 GitHub 数据 */
 export interface RawHistory {
   commits: Array<{

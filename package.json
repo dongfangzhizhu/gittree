@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:e2e": "node scripts/e2e-check.mjs",
-    "test:export": "node scripts/export-test.mjs"
+    "test:export": "node scripts/export-test.mjs",
+    "test:interaction": "node scripts/interaction-test.mjs"
   },
   "keywords": [
     "git",
@@ -25,5 +26,9 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.4",
     "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "@types/three": "^0.186.0",
+    "three": "^0.186.1"
   }
 }

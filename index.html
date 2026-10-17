@@ -3,11 +3,28 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Visualize Git commit history as a growing tree animation. Watch repositories evolve over time with beautiful 3D tree visualizations." />
+  <meta name="description" content="Visualize Git commit history as a growing 3D tree animation. Watch repositories evolve over time." />
   <meta name="theme-color" content="#0a0e27" />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext x=%2250%22 y=%2290%22 font-size=%2280%22 text-anchor=%22middle%22%3E🌳%3C/text%3E%3C/svg%3E" />
-  <title>代码年轮 - Git 提交历史可视化</title>
+  <title>代码年轮 - Git 提交历史三维可视化</title>
   <style>
+    :root {
+      --bg: #0a0e27;
+      --bg-2: #101635;
+      --panel: rgba(255, 255, 255, 0.045);
+      --panel-strong: rgba(255, 255, 255, 0.08);
+      --border: rgba(255, 255, 255, 0.1);
+      --accent: #4ecdc4;
+      --accent-2: #45b7d1;
+      --gold: #ffd700;
+      --purple: #9b59b6;
+      --text: #eef1f8;
+      --dim: #8a92b2;
+      --danger: #ff6b6b;
+      --radius: 14px;
+      --shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+
     * {
       margin: 0;
       padding: 0;
@@ -15,123 +32,347 @@
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%);
-      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+      background:
+        radial-gradient(1200px 600px at 85% -10%, rgba(78, 205, 196, 0.09), transparent 60%),
+        radial-gradient(900px 500px at -10% 110%, rgba(69, 183, 209, 0.08), transparent 60%),
+        linear-gradient(160deg, var(--bg) 0%, var(--bg-2) 100%);
+      background-attachment: fixed;
+      color: var(--text);
+      min-height: 100vh;
       overflow-x: hidden;
     }
 
-    .container {
-      max-width: 1400px;
+    .app {
+      max-width: 1440px;
       margin: 0 auto;
-      padding: 20px;
-    }
-
-    header {
-      text-align: center;
-      margin-bottom: 30px;
-      padding: 20px 0;
-    }
-
-    h1 {
-      font-size: 2.5em;
-      margin-bottom: 10px;
-      background: linear-gradient(135deg, #4ecdc4, #45b7d1);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
-    }
-
-    .subtitle {
-      color: #aaa;
-      font-size: 1.1em;
-    }
-
-    .input-area {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 8px;
-      padding: 20px;
-      margin-bottom: 20px;
-      backdrop-filter: blur(10px);
-    }
-
-    .input-group {
+      padding: 22px 28px 40px;
       display: flex;
-      gap: 10px;
-      margin-bottom: 10px;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    /* ===== 顶栏 ===== */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
       flex-wrap: wrap;
     }
 
-    .token-group {
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand .logo {
+      font-size: 34px;
+      filter: drop-shadow(0 4px 12px rgba(78, 205, 196, 0.35));
+    }
+
+    .brand h1 {
+      font-size: 26px;
+      letter-spacing: 1px;
+      background: linear-gradient(120deg, #7ef0e6, var(--accent) 45%, var(--accent-2));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand .tagline {
+      font-size: 12.5px;
+      color: var(--dim);
+      margin-top: 2px;
+      letter-spacing: 0.4px;
+    }
+
+    .top-actions a {
+      color: var(--dim);
+      text-decoration: none;
+      font-size: 13px;
+      padding: 8px 14px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .top-actions a:hover {
+      color: var(--accent);
+      border-color: rgba(78, 205, 196, 0.45);
+    }
+
+    /* ===== 加载区 ===== */
+    .loadbar {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      backdrop-filter: blur(12px);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .loadbar-row {
       display: flex;
       gap: 10px;
       align-items: center;
-      margin-bottom: 10px;
       flex-wrap: wrap;
+    }
+
+    .loadbar-row.secondary {
+      justify-content: space-between;
     }
 
     input[type="text"],
     input[type="password"] {
       flex: 1;
-      min-width: 200px;
-      padding: 12px;
-      background: rgba(255, 255, 255, 0.1);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 4px;
-      color: #fff;
+      min-width: 220px;
+      padding: 11px 14px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
       font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
 
-    input[type="text"]::placeholder,
-    input[type="password"]::placeholder {
-      color: #888;
+    input[type="text"]:focus,
+    input[type="password"]:focus {
+      border-color: rgba(78, 205, 196, 0.55);
+      box-shadow: 0 0 0 3px rgba(78, 205, 196, 0.12);
+    }
+
+    input::placeholder {
+      color: #6b7490;
     }
 
     button {
-      padding: 12px 24px;
-      background: linear-gradient(135deg, #4ecdc4, #45b7d1);
+      padding: 11px 20px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
       border: none;
-      border-radius: 4px;
-      color: white;
-      font-weight: bold;
+      border-radius: 10px;
+      color: #062a28;
+      font-weight: 700;
+      font-size: 14px;
       cursor: pointer;
-      transition: transform 0.2s, box-shadow 0.2s;
       white-space: nowrap;
+      transition: transform 0.15s, box-shadow 0.2s, opacity 0.2s;
     }
 
     button:hover:not(:disabled) {
-      transform: translateY(-2px);
-      box-shadow: 0 8px 16px rgba(78, 205, 196, 0.3);
+      transform: translateY(-1px);
+      box-shadow: 0 8px 20px rgba(78, 205, 196, 0.28);
+    }
+
+    button:active:not(:disabled) {
+      transform: translateY(0);
     }
 
     button:disabled {
-      opacity: 0.5;
+      opacity: 0.45;
       cursor: not-allowed;
+    }
+
+    button.ghost {
+      background: var(--panel-strong);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    button.ghost:hover:not(:disabled) {
+      border-color: rgba(78, 205, 196, 0.45);
+      box-shadow: none;
+    }
+
+    #cancelBtn {
+      background: rgba(255, 107, 107, 0.14);
+      color: var(--danger);
+      border: 1px solid rgba(255, 107, 107, 0.35);
+    }
+
+    /* 缓存开关 */
+    .cache-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--dim);
+      cursor: pointer;
+      user-select: none;
+      padding: 7px 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .cache-toggle:hover {
+      color: var(--text);
+      border-color: rgba(78, 205, 196, 0.4);
+    }
+
+    .cache-toggle input {
+      accent-color: var(--accent);
+      width: 15px;
+      height: 15px;
+      cursor: pointer;
+    }
+
+    .cache-toggle.on {
+      color: var(--accent);
+      border-color: rgba(78, 205, 196, 0.5);
+      background: rgba(78, 205, 196, 0.08);
+    }
+
+    .cache-status {
+      font-size: 12px;
+      color: var(--dim);
+    }
+
+    .cache-status .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(78, 205, 196, 0.14);
+      color: var(--accent);
+      margin-right: 6px;
+      font-size: 11px;
+    }
+
+    .cache-status button {
+      padding: 3px 10px;
+      font-size: 11px;
+      border-radius: 999px;
+      margin-left: 6px;
+    }
+
+    /* Token 折叠区 */
+    .token-details {
+      font-size: 13px;
+      color: var(--dim);
+    }
+
+    .token-details summary {
+      cursor: pointer;
+      padding: 7px 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      list-style: none;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .token-details summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .token-details summary:hover {
+      color: var(--text);
+      border-color: rgba(78, 205, 196, 0.4);
+    }
+
+    .token-details[open] summary {
+      color: var(--accent);
+      border-color: rgba(78, 205, 196, 0.45);
+    }
+
+    .token-group {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+
+    .token-group input {
+      flex: 1;
+      min-width: 200px;
+    }
+
+    .token-group button {
+      padding: 10px 14px;
     }
 
     .token-status {
       font-size: 12px;
-      color: #888;
-      display: flex;
-      align-items: center;
-      gap: 6px;
+      color: var(--dim);
     }
 
     .token-status.active {
-      color: #4ecdc4;
+      color: var(--accent);
+    }
+
+    .status {
+      font-size: 13px;
+      color: var(--dim);
+      min-height: 18px;
+    }
+
+    .error {
+      background: rgba(255, 107, 107, 0.1);
+      border: 1px solid rgba(255, 107, 107, 0.35);
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: var(--danger);
+      font-size: 13.5px;
+      display: none;
+    }
+
+    /* ===== 预置 ===== */
+    .presets {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 12px;
+    }
+
+    .preset-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      cursor: pointer;
+      transition: transform 0.15s, border-color 0.2s, background 0.2s;
+    }
+
+    .preset-card:hover {
+      transform: translateY(-2px);
+      border-color: rgba(78, 205, 196, 0.5);
+      background: rgba(78, 205, 196, 0.07);
+    }
+
+    .preset-card div {
+      font-weight: 700;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+
+    .preset-card strong {
+      display: block;
+      font-size: 12px;
+      color: var(--dim);
+      font-weight: 400;
+    }
+
+    /* ===== 舞台 ===== */
+    .stage {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
     }
 
     .canvas-container {
+      position: relative;
       width: 100%;
-      max-width: 1200px;
-      min-height: 400px;
-      background: rgba(255, 255, 255, 0.02);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 8px;
-      overflow: hidden;
-      margin-bottom: 20px;
       aspect-ratio: 16 / 9;
+      min-height: 480px;
+      max-height: 76vh;
+      background: radial-gradient(900px 480px at 50% 110%, rgba(78, 205, 196, 0.07), transparent 70%), var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
       display: none;
     }
 
@@ -139,166 +380,367 @@
       width: 100%;
       height: 100%;
       display: block;
+      cursor: grab;
     }
 
+    canvas:active {
+      cursor: grabbing;
+    }
+
+    /* HUD 覆盖层 */
+    .hud {
+      position: absolute;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    .hud-tl {
+      top: 16px;
+      left: 18px;
+    }
+
+    .hud-chapter {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      text-shadow: 0 2px 10px rgba(0, 0, 0, 0.6);
+    }
+
+    .hud-date {
+      font-size: 12.5px;
+      color: var(--dim);
+      margin-top: 3px;
+      text-shadow: 0 1px 6px rgba(0, 0, 0, 0.6);
+    }
+
+    .hud-tr {
+      top: 14px;
+      right: 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      pointer-events: auto;
+      background: rgba(10, 14, 39, 0.55);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 10px;
+      backdrop-filter: blur(10px);
+    }
+
+    .hud-label {
+      font-size: 11px;
+      color: var(--dim);
+      padding: 0 4px;
+    }
+
+    .view-btn {
+      padding: 5px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--dim);
+      border: 1px solid transparent;
+    }
+
+    .view-btn:hover {
+      color: var(--text);
+      box-shadow: none;
+      transform: none;
+    }
+
+    .view-btn.active {
+      color: #062a28;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    }
+
+    .rotate-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--dim);
+      cursor: pointer;
+      padding-left: 8px;
+      border-left: 1px solid var(--border);
+    }
+
+    .rotate-toggle input {
+      accent-color: var(--accent);
+      width: 13px;
+      height: 13px;
+      cursor: pointer;
+    }
+
+    .hud-hint {
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 12px;
+      color: var(--dim);
+      background: rgba(10, 14, 39, 0.5);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 16px;
+      backdrop-filter: blur(8px);
+      transition: opacity 0.3s;
+    }
+
+    /* 信息面板 */
+    .info-panel {
+      position: absolute;
+      top: 64px;
+      right: 14px;
+      width: 300px;
+      max-height: calc(100% - 120px);
+      overflow-y: auto;
+      background: rgba(13, 18, 46, 0.82);
+      border: 1px solid rgba(78, 205, 196, 0.3);
+      border-radius: 12px;
+      padding: 14px 16px;
+      backdrop-filter: blur(14px);
+      box-shadow: var(--shadow);
+      z-index: 6;
+      opacity: 0;
+      transform: translateX(12px);
+      pointer-events: none;
+      transition: opacity 0.25s, transform 0.25s;
+    }
+
+    .info-panel.open {
+      opacity: 1;
+      transform: translateX(0);
+      pointer-events: auto;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .panel-kind {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.5px;
+    }
+
+    .panel-close {
+      padding: 2px 8px;
+      font-size: 12px;
+      background: transparent;
+      color: var(--dim);
+      border-radius: 6px;
+    }
+
+    .panel-close:hover {
+      color: var(--text);
+      box-shadow: none;
+      transform: none;
+    }
+
+    .panel-title {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.45;
+      word-break: break-all;
+      margin-bottom: 10px;
+    }
+
+    .panel-meta {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 5px 12px;
+      font-size: 12.5px;
+    }
+
+    .panel-meta dt {
+      color: var(--dim);
+    }
+
+    .panel-meta dd {
+      color: var(--text);
+      word-break: break-all;
+    }
+
+    .panel-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+
+    .panel-actions button,
+    .panel-actions a {
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 8px;
+      text-decoration: none;
+      border: 1px solid rgba(78, 205, 196, 0.4);
+      color: var(--accent);
+      background: rgba(78, 205, 196, 0.1);
+      cursor: pointer;
+    }
+
+    .panel-actions button:hover,
+    .panel-actions a:hover {
+      background: rgba(78, 205, 196, 0.2);
+    }
+
+    /* ===== 播放控制条 ===== */
     .controls {
       display: none;
-      gap: 10px;
+      gap: 12px;
       align-items: center;
-      background: rgba(255, 255, 255, 0.05);
-      padding: 15px;
-      border-radius: 8px;
-      margin-bottom: 20px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      backdrop-filter: blur(12px);
       flex-wrap: wrap;
+    }
+
+    .controls button {
+      padding: 9px 16px;
     }
 
     .control-group {
       display: flex;
-      gap: 8px;
+      gap: 6px;
       align-items: center;
+      font-size: 12.5px;
+      color: var(--dim);
+    }
+
+    .control-group label {
+      white-space: nowrap;
+    }
+
+    select {
+      padding: 7px 10px;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 12.5px;
+      cursor: pointer;
+      outline: none;
     }
 
     input[type="range"] {
       flex: 1;
-      min-width: 100px;
-    }
-
-    button#cancelBtn[style*="display: none"] {
-      display: none;
-    }
-
-    select {
-      padding: 8px 12px;
-      background: rgba(255, 255, 255, 0.1);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 4px;
-      color: #fff;
+      min-width: 140px;
+      accent-color: var(--accent);
       cursor: pointer;
     }
 
+    .time-display {
+      font-variant-numeric: tabular-nums;
+      font-size: 13px;
+      color: var(--text);
+      min-width: 44px;
+      text-align: center;
+    }
+
+    /* ===== 导出区 ===== */
     .export-area {
       display: none;
       gap: 10px;
-      margin-bottom: 20px;
       flex-wrap: wrap;
     }
 
     .export-area button {
-      background: linear-gradient(135deg, #f39c12, #e67e22);
+      background: linear-gradient(135deg, #f5b942, #e67e22);
+      color: #3a2000;
     }
 
-    .status {
-      text-align: center;
-      font-size: 14px;
-      color: #aaa;
-      min-height: 20px;
-    }
-
-    .error {
-      background: rgba(255, 107, 107, 0.1);
-      border: 1px solid rgba(255, 107, 107, 0.3);
-      border-radius: 4px;
-      padding: 12px;
-      margin-bottom: 20px;
-      color: #ff6b6b;
-      display: none;
-    }
-
-    .presets {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-      gap: 12px;
-      margin-top: 20px;
-      margin-bottom: 20px;
-    }
-
-    .preset-card {
-      background: rgba(255, 255, 255, 0.1);
-      border: 2px solid rgba(255, 255, 255, 0.2);
-      border-radius: 6px;
-      padding: 16px;
-      text-align: center;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-
-    .preset-card:hover {
-      background: rgba(78, 205, 196, 0.1);
-      border-color: #4ecdc4;
-      transform: translateY(-2px);
-    }
-
-    .preset-card div {
-      font-weight: bold;
-      margin-bottom: 8px;
-    }
-
-    .preset-card strong {
-      display: block;
-      font-size: 12px;
-      color: #888;
+    .export-area button:hover:not(:disabled) {
+      box-shadow: 0 8px 20px rgba(230, 126, 34, 0.3);
     }
 
     footer {
       text-align: center;
-      padding: 20px;
-      border-top: 1px solid rgba(255, 255, 255, 0.1);
-      margin-top: 40px;
-      color: #666;
+      padding: 18px 0 4px;
+      border-top: 1px solid var(--border);
+      color: #5d6580;
       font-size: 12px;
+      line-height: 1.8;
     }
 
-    a {
-      color: #4ecdc4;
+    footer kbd {
+      background: var(--panel-strong);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 6px;
+      font-size: 11px;
+      font-family: inherit;
+    }
+
+    footer a {
+      color: var(--accent);
       text-decoration: none;
     }
 
-    a:hover {
+    footer a:hover {
       text-decoration: underline;
     }
 
-    @media (max-width: 768px) {
-      h1 {
-        font-size: 1.8em;
+    @media (max-width: 900px) {
+      .app {
+        padding: 16px 14px 30px;
       }
 
-      .input-group,
-      .token-group,
-      .controls,
-      .export-area {
-        flex-direction: column;
+      .canvas-container {
+        min-height: 380px;
+        aspect-ratio: auto;
+        height: 60vh;
       }
 
-      input[type="text"],
-      input[type="password"],
-      button {
-        width: 100%;
+      .hud-tr {
+        top: 10px;
+        right: 10px;
+        max-width: calc(100% - 20px);
       }
 
-      .control-group {
-        width: 100%;
+      .info-panel {
+        width: calc(100% - 28px);
+        top: auto;
+        bottom: 14px;
+        right: 14px;
+        max-height: 46%;
       }
 
-      .presets {
-        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      .controls {
+        gap: 8px;
       }
 
-      .token-status {
-        width: 100%;
-        justify-content: center;
+      input[type="range"] {
+        min-width: 100%;
       }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>代码年轮</h1>
-      <p class="subtitle">用树形可视化展示 Git 仓库的提交历史</p>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">🌳</span>
+        <div>
+          <h1>代码年轮</h1>
+          <p class="tagline">Git 提交历史 · 三维生长可视化</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <a href="https://github.com/yourusername/gittree" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
     </header>
 
-    <div class="input-area">
-      <div class="input-group">
+    <section class="loadbar">
+      <div class="loadbar-row">
         <input
           type="text"
           id="repoInput"
@@ -306,70 +748,99 @@
           aria-label="GitHub 仓库地址"
         />
         <button id="loadBtn">让它生长</button>
-        <button id="cancelBtn" style="display: none;">⏹ 取消</button>
+        <button id="cancelBtn" class="ghost" style="display: none;">⏹ 取消</button>
       </div>
-      <div class="token-group">
-        <input
-          type="password"
-          id="tokenInput"
-          placeholder="(可选) GitHub Token - 提高 API 限额到 5000/小时"
-          aria-label="GitHub Token"
-          style="flex: 1; min-width: 200px;"
-        />
-        <button id="tokenToggleBtn" title="显示/隐藏 Token" style="padding: 12px 16px;">👁</button>
-        <button id="tokenClearBtn" title="清除保存的 Token" style="padding: 12px 16px;">✕</button>
-        <span id="tokenStatus" class="token-status">未设置</span>
+      <div class="loadbar-row secondary">
+        <div class="loadbar-row" style="gap: 10px;">
+          <label class="cache-toggle" id="cacheToggleLabel" title="勾选后，首次拉取的数据会保存在浏览器本地；再次加载同一仓库时直接使用缓存，不再请求 GitHub">
+            <input type="checkbox" id="cacheToggle" />
+            <span>缓存此项目数据</span>
+          </label>
+          <span id="cacheStatus" class="cache-status"></span>
+        </div>
+        <details class="token-details">
+          <summary>GitHub Token（可选，限额 60→5000/小时）</summary>
+          <div class="token-group">
+            <input
+              type="password"
+              id="tokenInput"
+              placeholder="ghp_...（仅保存在本地浏览器）"
+              aria-label="GitHub Token"
+            />
+            <button id="tokenToggleBtn" class="ghost" title="显示/隐藏 Token">👁</button>
+            <button id="tokenClearBtn" class="ghost" title="清除保存的 Token">✕</button>
+            <span id="tokenStatus" class="token-status">未设置</span>
+          </div>
+        </details>
       </div>
       <div class="status" id="status"></div>
-    </div>
+    </section>
 
     <div id="errorBox" class="error"></div>
 
-    <div id="presets" class="presets"></div>
+    <section id="presets" class="presets"></section>
 
-    <div class="canvas-container" id="canvasContainer">
-      <canvas id="canvas"></canvas>
-    </div>
+    <main class="stage">
+      <div class="canvas-container" id="canvasContainer">
+        <canvas id="canvas"></canvas>
 
-    <div class="controls" id="controls">
-      <button id="playBtn">▶ 播放</button>
-      <button id="pauseBtn">⏸ 暂停</button>
-      <div class="control-group">
-        <label>速度:</label>
-        <select id="speedSelect">
-          <option value="0.5">0.5x</option>
-          <option value="1" selected>1x</option>
-          <option value="2">2x</option>
-          <option value="4">4x</option>
-        </select>
-      </div>
-      <div class="control-group">
-        <label>时长:</label>
-        <select id="durationSelect">
-          <option value="10">10s</option>
-          <option value="30" selected>30s</option>
-          <option value="60">60s</option>
-        </select>
-      </div>
-      <div class="control-group">
-        <input type="range" id="timeSlider" min="0" max="100" value="0" style="flex: 1; min-width: 200px;" />
-        <span id="timeDisplay">00:00</span>
-      </div>
-    </div>
+        <div class="hud hud-tl">
+          <div class="hud-chapter" id="hudChapter">萌芽期</div>
+          <div class="hud-date" id="hudDate">---- (UTC) · 进度 0%</div>
+        </div>
 
-    <div class="export-area" id="exportArea">
-      <button data-action="export-video" title="导出为 WebM 视频">📽 导出视频</button>
-      <button data-action="export-card" title="导出为 PNG 纪念卡">🎴 导出纪念卡</button>
-    </div>
+        <div class="hud hud-tr">
+          <span class="hud-label">视角</span>
+          <button class="view-btn active" data-view="overview">全景</button>
+          <button class="view-btn" data-view="side">侧视</button>
+          <button class="view-btn" data-view="top">俯视</button>
+          <button class="view-btn" data-view="root">根颈</button>
+          <label class="rotate-toggle" title="相机绕树自动旋转">
+            <input type="checkbox" id="autoRotate" /> 自动旋转
+          </label>
+        </div>
+
+        <aside class="info-panel" id="infoPanel"></aside>
+
+        <div class="hud hud-hint" id="pickHint">💡 点击树叶或果实查看详情 · 拖动旋转视角 · 滚轮缩放</div>
+      </div>
+
+      <div class="controls" id="controls">
+        <button id="playBtn">▶ 播放</button>
+        <button id="pauseBtn" class="ghost">⏸ 暂停</button>
+        <input type="range" id="timeSlider" min="0" max="100" value="0" aria-label="生长进度" />
+        <span id="timeDisplay" class="time-display">00:00</span>
+        <div class="control-group">
+          <label for="speedSelect">速度</label>
+          <select id="speedSelect">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label for="durationSelect">时长</label>
+          <select id="durationSelect">
+            <option value="10">10s</option>
+            <option value="30" selected>30s</option>
+            <option value="60">60s</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="export-area" id="exportArea">
+        <button data-action="export-video" title="导出为 WebM 视频">📽 导出视频</button>
+        <button data-action="export-card" title="导出为 PNG 纪念卡">🎴 导出纪念卡</button>
+      </div>
+    </main>
 
     <footer>
-      <p>代码年轮 © 2026 | <a href="https://github.com/yourusername/gittree" target="_blank">GitHub</a> | 快捷键: 空格播放 · ←→进度 · Home/End 跳转</p>
+      <p>快捷键：<kbd>空格</kbd> 播放/暂停 · <kbd>←</kbd><kbd>→</kbd> 进度 · <kbd>Home</kbd>/<kbd>End</kbd> 跳转首尾</p>
+      <p>代码年轮 © 2026 · 数据来自 GitHub REST API · <a href="https://github.com/yourusername/gittree" target="_blank" rel="noopener">GitHub</a></p>
     </footer>
   </div>
 
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>
-
-
-

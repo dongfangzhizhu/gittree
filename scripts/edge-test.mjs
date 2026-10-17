@@ -43,20 +43,9 @@ console.log(`状态: ${status} (${elapsed}s)`);
 
 if (status.includes("已加载")) {
   await page.waitForTimeout(2000);
-  const stats = await page.evaluate(() => {
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-    const w = canvas.width, h = canvas.height;
-    const data = ctx.getImageData(0, 0, w, h).data;
-    let nonBg = 0, total = 0;
-    for (let y = 0; y < h; y += 4) for (let x = 0; x < w; x += 4) {
-      const i = (y * w + x) * 4;
-      total++;
-      if (!(data[i] < 45 && data[i+1] < 55 && data[i+2] < 80)) nonBg++;
-    }
-    return { ratio: nonBg / total };
-  });
-  console.log(`✅ 大仓库加载成功，画布非空白（${(stats.ratio * 100).toFixed(2)}%）`);
+  const stats = await page.evaluate(() => window.__gittree?.sampleCanvas() ?? null);
+  const ratio = stats?.nonBgRatio ?? 0;
+  console.log(`✅ 大仓库加载成功，画布非空白（${(ratio * 100).toFixed(2)}%）`);
   await page.screenshot({ path: "screenshots/05-big-repo.png" });
 } else {
   console.log("❌ 大仓库加载失败（可能是限流，可接受，需人工复试）");

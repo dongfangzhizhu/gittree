@@ -36,35 +36,9 @@ function report(name, pass, detail = "") {
   console.log(`${pass ? "✅" : "❌"} ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
-/** 读取画布中心区域像素均值, 判断是否非空白 */
+/** 读取画布像素统计（WebGL 画布经页面调试钩子 sampleCanvas 读取） */
 async function canvasStats(page) {
-  return page.evaluate(() => {
-    const canvas = document.getElementById("canvas");
-    if (!canvas) return null;
-    const ctx = canvas.getContext("2d");
-    const w = canvas.width;
-    const h = canvas.height;
-    if (!w || !h) return { w, h, nonBgRatio: 0, distinctColors: 0 };
-    const data = ctx.getImageData(0, 0, w, h).data;
-    let nonBg = 0;
-    let total = 0;
-    const colors = new Set();
-    // 采样: 每 4 像素取一个, 控制开销
-    for (let y = 0; y < h; y += 4) {
-      for (let x = 0; x < w; x += 4) {
-        const i = (y * w + x) * 4;
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        total++;
-        // 背景色约为 #0a0e27 ~ #1a1f3a 范围
-        const isBg = r < 45 && g < 55 && b < 80;
-        if (!isBg) nonBg++;
-        colors.add(`${r >> 4},${g >> 4},${b >> 4}`);
-      }
-    }
-    return { w, h, nonBgRatio: nonBg / Math.max(1, total), distinctColors: colors.size };
-  });
+  return page.evaluate(() => window.__gittree?.sampleCanvas() ?? null);
 }
 
 const browser = await chromium.launch({
