@@ -11,6 +11,7 @@ import { layout } from "./layout/tree-layout";
 import { renderFrame } from "./rendering/canvas-renderer";
 import { parseGitHubInput } from "./core/input-parser";
 import { PRESETS } from "./presets";
+import { createTokenUI } from "./ui/token-ui";
 
 interface AppState {
   isLoading: boolean;
@@ -20,6 +21,7 @@ interface AppState {
   currentTime: number;
   duration: number;
   speed: number;
+  token?: string;
 }
 
 const state: AppState = {
@@ -31,6 +33,9 @@ const state: AppState = {
   duration: 30,
   speed: 1,
 };
+
+// Token UI 初始化
+const tokenUI = createTokenUI();
 
 // UI 元素
 const repoInput = document.getElementById("repoInput") as HTMLInputElement;
@@ -115,7 +120,7 @@ async function loadRepository() {
     // 获取数据
     const source = new GitHubSource();
     const signal = new AbortController().signal;
-    const raw = await source.load(`${owner}/${repo}`, {}, signal);
+    const raw = await source.load(`${owner}/${repo}`, { token: tokenUI.getToken() }, signal);
 
     showStatus("正在处理数据...");
 
@@ -471,3 +476,4 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+

@@ -60,7 +60,16 @@
       flex-wrap: wrap;
     }
 
-    input[type="text"] {
+    .token-group {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    input[type="text"],
+    input[type="password"] {
       flex: 1;
       min-width: 200px;
       padding: 12px;
@@ -71,7 +80,8 @@
       font-size: 14px;
     }
 
-    input[type="text"]::placeholder {
+    input[type="text"]::placeholder,
+    input[type="password"]::placeholder {
       color: #888;
     }
 
@@ -95,6 +105,18 @@
     button:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+    }
+
+    .token-status {
+      font-size: 12px;
+      color: #888;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .token-status.active {
+      color: #4ecdc4;
     }
 
     .canvas-container {
@@ -231,12 +253,14 @@
       }
 
       .input-group,
+      .token-group,
       .controls,
       .export-area {
         flex-direction: column;
       }
 
       input[type="text"],
+      input[type="password"],
       button {
         width: 100%;
       }
@@ -247,6 +271,11 @@
 
       .presets {
         grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      }
+
+      .token-status {
+        width: 100%;
+        justify-content: center;
       }
     }
   </style>
@@ -267,6 +296,18 @@
           aria-label="GitHub 仓库地址"
         />
         <button id="loadBtn">让它生长</button>
+      </div>
+      <div class="token-group">
+        <input
+          type="password"
+          id="tokenInput"
+          placeholder="(可选) GitHub Token - 提高 API 限额到 5000/小时"
+          aria-label="GitHub Token"
+          style="flex: 1; min-width: 200px;"
+        />
+        <button id="tokenToggleBtn" title="显示/隐藏 Token" style="padding: 12px 16px;">👁</button>
+        <button id="tokenClearBtn" title="清除保存的 Token" style="padding: 12px 16px;">✕</button>
+        <span id="tokenStatus" class="token-status">未设置</span>
       </div>
       <div class="status" id="status"></div>
     </div>
