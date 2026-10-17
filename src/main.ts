@@ -161,6 +161,12 @@ const signal = loadAbortController.signal;
     state.model = model;
     state.geometry = geometry;
 
+    // 更新 URL 以便分享
+const sourceRepo = model.source?.repo ? `${model.source.owner}/${model.source.repo}` : "";
+if (sourceRepo && !window.location.search.includes(sourceRepo)) {
+  window.history.replaceState({}, "", `?repo=${encodeURIComponent(sourceRepo)}`);
+}
+
     showStatus(`已加载 ${model.commits.length} 个提交（${Math.floor(samplingRate * 100)}% 采样）`);
     showCanvas();
     startPlayback(); // 自动播放
@@ -192,6 +198,12 @@ async function loadPreset(index: number) {
 
     state.model = model;
     state.geometry = geometry;
+
+    // 更新 URL 以便分享
+const sourceRepo = model.source?.repo ? `${model.source.owner}/${model.source.repo}` : "";
+if (sourceRepo && !window.location.search.includes(sourceRepo)) {
+  window.history.replaceState({}, "", `?repo=${encodeURIComponent(sourceRepo)}`);
+}
 
     showStatus(`已加载 ${model.commits.length} 个提交`);
     showCanvas();
@@ -487,9 +499,21 @@ function initPresets() {
   presetsContainer.style.display = "grid";
 }
 
+// 处理 URL 参数加载仓库
+function initFromURL() {
+  const params = new URLSearchParams(window.location.search);
+  const repo = params.get("repo");
+  if (repo) {
+    repoInput.value = repo;
+    // 自动加载
+    setTimeout(() => loadRepository(), 500);
+  }
+}
+
 // 初始化
 window.addEventListener("resize", render);
 initPresets();
+initFromURL();
 
 // 添加导出按钮事件（假设存在 HTML 中）
 const exportVideoBtn = document.querySelector("[data-action=export-video]") as HTMLButtonElement;
@@ -503,6 +527,7 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+
 
 
 
