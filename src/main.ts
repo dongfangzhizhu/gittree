@@ -12,6 +12,7 @@ import { renderFrame } from "./rendering/canvas-renderer";
 import { parseGitHubInput } from "./core/input-parser";
 import { PRESETS } from "./presets";
 import { createTokenUI } from "./ui/token-ui";
+import { formatErrorForUI } from "./ui/error-handler";
 
 interface AppState {
   isLoading: boolean;
@@ -150,7 +151,7 @@ async function loadRepository() {
     startPlayback(); // 自动播放
     render();
   } catch (error: any) {
-    showError(error.message || "加载失败");
+    showError(formatErrorForUI(error));
   } finally {
     state.isLoading = false;
     loadBtn.disabled = false;
@@ -180,7 +181,7 @@ async function loadPreset(index: number) {
     startPlayback();
     render();
   } catch (error: any) {
-    showError(error.message || "加载预置失败");
+    showError(formatErrorForUI(error));
   } finally {
     state.isLoading = false;
   }
@@ -245,7 +246,7 @@ async function exportVideo() {
 
     mediaRecorder.stop();
   } catch (error: any) {
-    showError(`导出失败: ${error.message}`);
+    showError(formatErrorForUI(error));
     loadBtn.disabled = false;
   }
 }
@@ -342,7 +343,7 @@ async function exportCard() {
       showStatus("纪念卡已导出");
     });
   } catch (error: any) {
-    showError(`导出失败: ${error.message}`);
+    showError(formatErrorForUI(error));
   }
 }
 
@@ -476,4 +477,6 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+
+
 
