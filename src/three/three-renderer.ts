@@ -213,17 +213,19 @@ export class TreeRenderer {
   }
 
   /**
-   * 在当前 fov 与画幅下装下整棵树所需的相机距离。
+   * 在当前 fov 与画幅下装下整棵树（整片森林）所需的相机距离。
    * 树高 800+、宽 400+，用固定距离必然裁切，故按 fov 反算。
+   * 森林里斜视时近处的树会被投影到画面下方，需要额外留边，否则树根出画。
    */
   private fitDistance(margin = 1.1): number {
     const s = this.scene3d;
     if (!s) return 1200;
+    const extra = this.forest.length > 1 ? 1.22 : 1;
     const tanV = Math.tan((this.camera.fov * Math.PI) / 360);
     const tanH = tanV * Math.max(0.55, this.camera.aspect);
     const halfH = Math.max(s.height * 0.55, 120);
     const halfW = Math.max(s.radius * 1.15, s.height * 0.2);
-    return Math.max(halfH / tanV, halfW / tanH) * margin;
+    return Math.max(halfH / tanV, halfW / tanH) * margin * extra;
   }
 
   /** 默认机位：正对整棵树，略高俯视 */
