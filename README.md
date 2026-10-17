@@ -6,6 +6,9 @@
 
 **三维可视化**
 - three.js 实时渲染：主干带确定性弯曲、支线以 25°–60° 仰角绕主干散开、嫁接弧连接 merge
+- **连续管状枝干**：每条 lane 由一串控制点经 CatmullRom 平滑成一条连续管道，配合平行传输标架与连续锥度，消除逐段圆柱拼接的接缝折痕
+- **形态贴近真实**：主干底部指数衰减的根颈膨大、枝条由基部向梢部上拱 16°、分枝层级越深越短越向上（避免树冠横向摊平）、主干高/冠半径约 2.3:1
+- **自适应取景**：按相机 fov 与画布长宽比反算能装下整棵树的距离，四个预设视角共用同一套取景计算，不再裁切
 - 叶（按提交类型与作者着色，8 种叶形）+ 果实（主版本金星状八面体 / 普通标签金球 / `spec:`、`hook:` 提交的紫色果实）
 - 年轮地纹 + 确定性星空 + 半球光/主光/轮廓光
 - 视角：拖动旋转、滚轮缩放（OrbitControls），四个预设视角（全景/侧视/俯视/根颈）+ 自动旋转
@@ -13,15 +16,23 @@
 **交互**
 - 点击叶片或果实 → 信息面板显示提交类型、作者、UTC 日期、SHA、父提交数、所属标签，可「定位到此处」飞向节点，数据源为 GitHub 时附提交链接
 - 悬停高亮、选中节点脉冲光环
+- **任何状态下都可点击**：播放中与暂停中、任意视角下均可响应鼠标事件；射线未命中时按屏幕投影就近拾取（`pickNearest`），小节点也点得中
+- **暂停时相机照常响应**：视角切换 / 自动旋转 / 拖拽旋转 / 滚轮缩放都由渲染器自带的空闲帧循环驱动（播放暂停不影响），阻尼能自然收敛
+
+**内置真实仓库快照**
+- 预置区按「演示林 / 精选真实仓库」分组，后者内置 facebook/react、vuejs/core、microsoft/TypeScript 的提交快照（`public/snapshots/`）
+- 点击即渲染，不消耗 GitHub API 限额，离线也能看到真实仓库形态
+- 快照会额外取回最近 10 个标签指向的提交，保证树上真有果实（否则采样页里一个标签都命中不上）
+- 快照由 `scripts/fetch-snapshots.mjs` 抓取，可 `--only <owner/repo>` 单仓增量更新，`--tag-only` 只补标签提交
 
 **数据缓存**
 - 勾选「缓存此项目数据」后，首次拉取写入 `localStorage`；再次加载同一仓库**零 API 请求**直接命中
 - 状态区显示缓存年龄与「清除」按钮；开关状态本地持久化；配额不足时明确提示（不静默失败）
 
 **播放与导出**
-- 播放/暂停、0.5×–4× 调速、10–60s 时长、拖动时间轴、空格/方向键/Home/End 快捷键
+- 播放/暂停合并为一个开关按钮（按钮文案随状态切换）、0.5×–4× 调速、10–60s 时长、拖动时间轴、空格/方向键/Home/End 快捷键
 - 章节字幕（萌芽期/扩张期/重构期/沉淀期/当下……）+ UTC 日期 + 进度；风动摇曳、沉寂期落叶
-- 导出 WebM 视频（30fps 1920×1080，含字幕合成层）与 PNG 纪念卡（三维画面 + 统计网格）
+- 导出 WebM 视频（30fps 1920×1080，含字幕合成层）与 PNG 纪念卡（三维画面 + 统计网格），入口固定在顶栏
 
 **工程**
 - 确定性：同一仓库永远得到同一棵树（种子化 PRNG；场景构建与时间驱动均为纯函数）
@@ -34,7 +45,7 @@
 npm install
 npm run dev         # 开发服务器 http://localhost:5173
 npm run build       # 生产构建（tsc 类型检查 + vite build）
-npm test            # 单元测试（vitest，64 个用例）
+npm test            # 单元测试（vitest，77 个用例）
 npm run test:e2e    # 端到端测试（Playwright + 系统 Chrome，需先启动 dev server）
 npm run test:export # 导出功能测试（WebM/PNG 下载校验）
 npm run test:interaction # 视角/点击/缓存交互测试（--repo 可加真实仓库验证缓存）
@@ -58,12 +69,16 @@ src/
 ├── layout/
 │   └── prng.ts             # Mulberry32 + hash32（确定性随机源）
 ├── three/
-│   ├── scene-types.ts      # 三维场景描述类型（纯数据）
+│   ├── scene-types.ts      # 三维场景描述类型（纯数据，含 SceneBranch 连续管控制点）
 │   ├── scene-builder.ts    # 纯函数：生长模型 → 三维几何（主干弯曲/支线方位角/叶果/嫁接弧）
+│   ├── branch-geometry.ts  # 纯函数：控制点 → 连续管几何（CatmullRom + 平行传输标架 + 按环索引）
 │   └── three-renderer.ts   # WebGLRenderer + OrbitControls + InstancedMesh + 射线拾取
 ├── ui/          # Token / 错误 / 浏览器能力检测 / 节点信息面板
 ├── presets.ts   # 演示林（走真实数据管线生成）
 └── main.ts      # 入口：加载编排 / 播放状态机 / 交互 / 导出
+
+public/snapshots/            # 内置真实仓库快照（JSON）+ index.json 索引
+scripts/fetch-snapshots.mjs  # 快照抓取脚本（分页 + 标签，支持单仓增量更新）
 ```
 
 数据流：`GitHubSource（或缓存）→ normalize → sample → reconnect → buildGrowthModel → buildScene → TreeRenderer.updateTree(t)`
@@ -72,9 +87,9 @@ src/
 
 | 层级 | 内容 | 命令 |
 | --- | --- | --- |
-| 单元 | normalize / sampler / growth-model 结构与规则；scene-builder 确定性/等距/锥度/叶果派生；cache 读写/校验/配额；github-source 分页与错误路径（mock fetch，不耗限额） | `npm test` |
-| 端到端 | 打开页面自动出树、WebGL 像素采样、动画推进、播放/暂停/拖动、导出按钮可见、真实仓库加载 | `npm run test:e2e` |
-| 交互 | 视角预设与相机移动、自动旋转、点击叶片/果实打开信息面板、缓存命中与零请求、清除缓存 | `npm run test:interaction` |
+| 单元 | normalize / sampler / growth-model 结构与规则；scene-builder 确定性/等距/锥度/叶果派生；branch-geometry 环数/索引连续性/可见环二分/平滑度；cache 读写/校验/配额；github-source 分页与错误路径（mock fetch，不耗限额） | `npm test` |
+| 端到端 | 打开页面自动出树、WebGL 像素采样、动画推进、单按钮播放/暂停切换与文案、拖动时间轴、导出按钮可见、真实仓库加载 | `npm run test:e2e` |
+| 交互 | 视角预设与相机移动、自动旋转、**暂停状态下的视角/自动旋转/拖拽/滚轮**、**播放/暂停 × 4 视角 全矩阵点击**（8 组均需打开信息面板）、缓存命中与零请求、清除缓存 | `npm run test:interaction` |
 | 导出 | WebM/PNG 下载文件的魔数与大小校验 | `npm run test:export` |
 
 端到端测试支持参数：`node scripts/e2e-check.mjs --url <地址> --repo <owner/repo> --out <目录>`
@@ -89,6 +104,8 @@ WebGL 画布的像素统计通过页面调试钩子 `window.__gittree.sampleCanv
 - 三维包体约 620 kB（gzip 约 160 kB，主要来自 three.js）；未做按需分包
 - 线性历史仓库（无分支）视觉上呈「一根主干 + 叶片」的幼树形态，这是数据本身的形状，非渲染缺陷
 - 导出的 WebM 不含 HTML 覆盖层（视角按钮等），字幕与统计由 Canvas 合成
+- 内置快照为抓取时刻的定版数据（每仓 440+ 提交），不会自动跟随上游更新；标签数远多于上树果实数（如 React 180 个标签中 11 个落在采样提交上），卡片按「上树/总数」显示
+- 本地若只监听 IPv6（`[::1]`），Playwright 用 `127.0.0.1` 会 `ERR_CONNECTION_REFUSED`，启动时加 `--host 127.0.0.1`
 
 ## License
 

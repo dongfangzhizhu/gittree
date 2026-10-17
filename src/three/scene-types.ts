@@ -55,6 +55,18 @@ export interface SceneFruit {
   kind: "major" | "normal" | "spec";
 }
 
+/** 一条枝干的连续折线（渲染时生成单根管状网格，避免逐段拼接的接缝） */
+export interface SceneBranch {
+  laneId: number;
+  kind: "trunk" | "branch";
+  /** 折线点（根 → 梢），长度 = 段数 + 1 */
+  points: Vec3[];
+  /** 每个点的半径（与 points 等长，锥度连续） */
+  radii: number[];
+  /** 每段的生长时间窗口，长度 = 段数 */
+  births: Array<[number, number]>;
+}
+
 export interface SceneChapter {
   title: string;
   season: string;
@@ -66,6 +78,8 @@ export interface SceneChapter {
 export interface ThreeScene {
   seed: string;
   segments: SceneSegment[];
+  /** 每条 lane 一根连续管（主干/支线），渲染器据此建单根平滑网格 */
+  branches: SceneBranch[];
   leaves: SceneLeaf[];
   fruits: SceneFruit[];
   chapters: SceneChapter[];

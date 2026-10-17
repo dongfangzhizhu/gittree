@@ -81,71 +81,172 @@ report(
 );
 await page.uncheck("#autoRotate");
 
-// ============ 3. 节点点击拾取 ============
-console.log("\n== 节点点击 ==");
-// 拖到末尾让树完整，再从上往下扫几个点找可拾取节点
-await page.evaluate(() => {
-  const slider = document.getElementById("timeSlider");
-  slider.value = "100";
-  slider.dispatchEvent(new Event("input", { bubbles: true }));
+// ============ 3. 暂停状态下的相机交互 ============
+// 需求：无论暂停还是播放、无论哪个视角，鼠标事件都要响应
+console.log("\n== 暂停状态下的相机交互 ==");
+await seek(60); // 拖时间轴会自动暂停
+const pausedNow = await page.evaluate(() => window.__gittree.getState().isPlaying);
+report("拖时间轴后进入暂停状态", pausedNow === false);
+
+const camPaused0 = await page.evaluate(() => window.__gittree.getCamera());
+await page.click('[data-view="side"]');
+await page.waitForTimeout(1300);
+const camPaused1 = await page.evaluate(() => window.__gittree.getCamera());
+report(
+  "暂停状态下切换视角生效",
+  JSON.stringify(camPaused0.position) !== JSON.stringify(camPaused1.position),
+  `position: ${camPaused1.position.map((v) => Math.round(v)).join(",")}`
+);
+
+await page.check("#autoRotate");
+await page.waitForTimeout(1300);
+const camPaused2 = await page.evaluate(() => window.__gittree.getCamera());
+report(
+  "暂停状态下自动旋转生效",
+  JSON.stringify(camPaused1.position) !== JSON.stringify(camPaused2.position)
+);
+await page.uncheck("#autoRotate");
+await page.waitForTimeout(400);
+
+// 拖拽旋转
+await page.evaluate(() => document.querySelector(".stage").scrollIntoView({ block: "center" }));
+await page.waitForTimeout(300);
+const canvasBox = await page.evaluate(() => {
+  const r = document.getElementById("canvas").getBoundingClientRect();
+  return { x: Math.round(r.left + r.width * 0.28), y: Math.round(r.top + 120) };
 });
-await page.waitForTimeout(800);
+const camDrag0 = await page.evaluate(() => window.__gittree.getCamera());
+await page.mouse.move(canvasBox.x, canvasBox.y);
+await page.mouse.down();
+for (let i = 1; i <= 8; i++) await page.mouse.move(canvasBox.x + i * 16, canvasBox.y + i * 3);
+await page.mouse.up();
+await page.waitForTimeout(600);
+const camDrag1 = await page.evaluate(() => window.__gittree.getCamera());
+report(
+  "暂停状态下拖拽旋转生效",
+  JSON.stringify(camDrag0.position) !== JSON.stringify(camDrag1.position)
+);
 
-// 拖到末尾让树完整，再逐个点击已知节点的投影位置
-await page.evaluate(() => {
-  const slider = document.getElementById("timeSlider");
-  slider.value = "100";
-  slider.dispatchEvent(new Event("input", { bubbles: true }));
-});
-await page.waitForTimeout(800);
+// 滚轮缩放
+const distToTarget = (c) =>
+  Math.hypot(c.position[0] - c.target[0], c.position[1] - c.target[1], c.position[2] - c.target[2]);
+const dBefore = distToTarget(camDrag1);
+await page.mouse.move(canvasBox.x, canvasBox.y);
+await page.mouse.wheel(0, -320);
+await page.waitForTimeout(600);
+const camZoom = await page.evaluate(() => window.__gittree.getCamera());
+const dAfter = distToTarget(camZoom);
+report(
+  "暂停状态下滚轮缩放生效",
+  dAfter < dBefore * 0.98,
+  `距离 ${Math.round(dBefore)} → ${Math.round(dAfter)}`
+);
 
-const leafKeys = await page.evaluate(() => window.__gittree.sampleLeafKeys(30));
-const fruitKeys = await page.evaluate(() => window.__gittree.sampleFruitKeys(10));
-const allKeys = [...leafKeys, ...fruitKeys];
+await page.click('[data-view="overview"]');
+await page.waitForTimeout(1300);
 
-let opened = false;
-let pickedTitle = "";
-let pickedMeta = "";
-for (const key of allKeys) {
-  const pos = await page.evaluate((k) => window.__gittree.nodeScreenPos(k), key);
-  if (!pos) continue;
-  await page.mouse.click(pos.x, pos.y);
-  await page.waitForTimeout(120);
-  const state = await page.evaluate(() => {
-    const panel = document.getElementById("infoPanel");
-    return {
-      open: panel.classList.contains("open"),
-      title: panel.querySelector(".panel-title")?.textContent || "",
-      meta: panel.querySelector(".panel-meta")?.textContent || "",
-    };
-  });
-  if (state.open) {
-    opened = true;
-    pickedTitle = state.title;
-    pickedMeta = state.meta;
-    report("点击树叶/果实打开信息面板", true, `「${state.title}」`);
+// ============ 4. 节点点击拾取：播放/暂停 × 4 视角 全矩阵 ============
+console.log("\n== 节点点击矩阵（播放/暂停 × 4 视角） ==");
+
+const VIEWS = [
+  { key: "overview", name: "全景" },
+  { key: "side", name: "侧视" },
+  { key: "top", name: "俯视" },
+  { key: "root", name: "根颈" },
+];
+
+/** 拖动时间轴到指定百分比 */
+async function seek(pct) {
+  await page.evaluate((v) => {
+    const slider = document.getElementById("timeSlider");
+    slider.value = String(v);
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  }, pct);
+  await page.waitForTimeout(150);
+}
+
+/** 幂等地把播放状态切到指定值 */
+async function setPlaying(playing) {
+  await page.evaluate((want) => {
+    const cur = window.__gittree.getState().isPlaying;
+    if (cur !== want) document.getElementById("playPauseBtn").click();
+  }, playing);
+  await page.waitForTimeout(200);
+}
+
+/** 依次点击候选节点的屏幕投影，命中即关闭面板并返回结果 */
+async function tryClickAnyNode() {
+  const keys = [
+    ...(await page.evaluate(() => window.__gittree.sampleLeafKeys(28))),
+    ...(await page.evaluate(() => window.__gittree.sampleFruitKeys(10))),
+  ];
+  let tried = 0;
+  for (const key of keys) {
+    const pos = await page.evaluate((k) => window.__gittree.nodeScreenPos(k), key);
+    if (!pos) continue;
+    const x = Math.round(pos.x);
+    const y = Math.round(pos.y);
+    if (x < 4 || y < 4 || x > 1436 || y > 896) continue;
+    tried++;
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(110);
+    const st = await page.evaluate(() => {
+      const panel = document.getElementById("infoPanel");
+      return {
+        open: panel.classList.contains("open"),
+        title: panel.querySelector(".panel-title")?.textContent || "",
+        meta: panel.querySelector(".panel-meta")?.textContent || "",
+      };
+    });
+    if (st.open) {
+      await page.click(".panel-close");
+      await page.waitForTimeout(130);
+      const closed = await page.evaluate(
+        () => !document.getElementById("infoPanel").classList.contains("open")
+      );
+      return { ...st, tried, closed };
+    }
+  }
+  return { open: false, tried, closed: false, title: "", meta: "" };
+}
+
+// 时长拉到 60s：树基本长成（90%）后仍留 6s 播放窗口供点击
+await page.selectOption("#durationSelect", "60");
+await page.waitForTimeout(200);
+
+let closeOk = false;
+for (const playing of [false, true]) {
+  for (const view of VIEWS) {
+    await setPlaying(false);
+    await page.click(`[data-view="${view.key}"]`);
+    await page.waitForTimeout(1300); // 等相机过渡完成
+    await seek(90);
+    await setPlaying(playing);
+
+    const r = await tryClickAnyNode();
+    const label = `${view.name}·${playing ? "播放中" : "暂停中"}`;
     report(
-      "面板包含提交元数据",
-      /类型|作者|日期|SHA|标签/.test(state.meta),
-      state.meta.slice(0, 80)
+      `点击节点打开信息面板（${label}）`,
+      r.open,
+      r.open ? `「${r.title}」，尝试 ${r.tried} 个` : `${r.tried} 个节点投影均未命中`
     );
-    break;
+    if (r.open) {
+      report(
+        `面板含提交元数据（${label}）`,
+        /类型|作者|日期|SHA|标签/.test(r.meta),
+        r.meta.slice(0, 60)
+      );
+      closeOk = closeOk || r.closed;
+    }
+    await page.screenshot({
+      path: resolve(OUT_DIR, `13-node-${view.key}-${playing ? "playing" : "paused"}.png`),
+    });
   }
 }
-if (!opened) {
-  report("点击树叶/果实打开信息面板", false, `${allKeys.length} 个节点投影点击均未命中`);
-}
-await page.screenshot({ path: resolve(OUT_DIR, "12-node-info.png") });
+report("信息面板可关闭", closeOk);
+await setPlaying(false);
 
-// 关闭面板
-await page.click(".panel-close");
-await page.waitForTimeout(200);
-const closed = await page.evaluate(() =>
-  !document.getElementById("infoPanel").classList.contains("open")
-);
-report("信息面板可关闭", closed);
-
-// ============ 4. 数据缓存 ============
+// ============ 5. 数据缓存 ============
 if (TEST_REPO) {
   console.log(`\n== 数据缓存（${TEST_REPO}） ==`);
   // 开启缓存

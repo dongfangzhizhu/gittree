@@ -66,8 +66,7 @@ const tokenUI = createTokenUI();
 // UI 元素
 const repoInput = document.getElementById("repoInput") as HTMLInputElement;
 const loadBtn = document.getElementById("loadBtn") as HTMLButtonElement;
-const playBtn = document.getElementById("playBtn") as HTMLButtonElement;
-const pauseBtn = document.getElementById("pauseBtn") as HTMLButtonElement;
+const playPauseBtn = document.getElementById("playPauseBtn") as HTMLButtonElement;
 const speedSelect = document.getElementById("speedSelect") as HTMLSelectElement;
 const durationSelect = document.getElementById("durationSelect") as HTMLSelectElement;
 const timeSlider = document.getElementById("timeSlider") as HTMLInputElement;
@@ -184,20 +183,9 @@ async function loadRepository() {
     // 构建生长模型与三维场景
     const model = buildGrowthModel(reconnected, raw.tags, samplingRate);
     model.source = { kind: "github", owner, repo };
-    const scene = buildScene(model, { seed: repoFull });
 
-    state.model = model;
     state.fromCache = fromCache;
     state.cacheSavedAt = cacheSavedAt;
-
-    const r = ensureRenderer();
-    if (!r) return;
-    r.setScene(scene);
-
-    // 重置播放进度：新树从 t=0 开始生长
-    pausePlayback();
-    state.currentTime = 0;
-    infoPanel.show(null);
 
     // 更新 URL 以便分享
     if (!window.location.search.includes(repoFull)) {
@@ -207,11 +195,9 @@ async function loadRepository() {
     const cacheNote = fromCache && cacheSavedAt
       ? ` · 来自缓存（${formatCacheAge(cacheSavedAt)}）`
       : "";
-    showStatus(`已加载 ${model.commits.length} 个提交（${Math.floor(samplingRate * 100)}% 采样）${cacheNote}`);
+    const ok = showModel(model, repoFull, `已加载 ${model.commits.length} 个提交（${Math.floor(samplingRate * 100)}% 采样）${cacheNote}`);
+    if (!ok) return;
     refreshCacheStatus(repoFull);
-    showCanvas();
-    startPlayback(); // 自动播放
-    render();
   } catch (error: any) {
     showError(formatErrorForUI(error));
   } finally {
@@ -223,7 +209,78 @@ async function loadRepository() {
 }
 
 /**
- * 加载预置（本地数据，不走缓存）
+ * 公共收尾：模型 → 三维场景 → 重置进度 → 自动播放
+ */
+function showModel(model: GrowthModel, seed: string, statusText: string): boolean {
+  const r = ensureRenderer();
+  if (!r) return false;
+
+  const scene = buildScene(model, { seed: seed || `${model.source.owner}/${model.source.repo}` });
+  state.model = model;
+  r.setScene(scene);
+
+  // 重置播放进度：新树从 t=0 开始生长
+  pausePlayback();
+  state.currentTime = 0;
+  infoPanel.show(null);
+
+  showStatus(statusText);
+  showCanvas();
+  startPlayback();
+  render();
+  return true;
+}
+
+/**
+ * 加载内置快照（仓库真实数据，抓取后随应用分发，不消耗 API 限额）
+ */
+async function loadSnapshot(entry: SnapshotEntry) {
+  try {
+    state.isLoading = true;
+    clearError();
+    showStatus(`正在加载内置快照：${entry.label}...`);
+
+    const res = await fetch(`snapshots/${entry.file}`);
+    if (!res.ok) throw new Error(`快照读取失败（HTTP ${res.status}）`);
+    const data = await res.json();
+    const raw = data.raw as RawHistory;
+    if (!raw || !Array.isArray(raw.commits)) throw new Error("快照结构异常：缺少提交数据");
+
+    const normalized = normalizeCommits(raw);
+    if (normalized.length === 0) {
+      throw new AppError("EMPTY_REPO", ErrorMessages.EMPTY_REPO.message, 404);
+    }
+    const tagMap = associateTags(normalized, raw.tags || []);
+    const taggedIds = new Set(Array.from(tagMap.keys()));
+    const { commits: sampled, samplingRate } = sampleCommits(normalized, taggedIds);
+    const reconnected = reconnectParents(sampled, normalized);
+
+    const model = buildGrowthModel(reconnected, raw.tags || [], samplingRate);
+    const [owner, repo] = entry.repo.split("/");
+    model.source = { kind: "github", owner, repo };
+
+    state.fromCache = true; // 快照等同「本地已有数据」
+    state.cacheSavedAt = data.fetchedAt ?? null;
+    currentRepoFull = entry.repo;
+    repoInput.value = entry.repo;
+
+    const tagNote = entry.tags ? ` · ${entry.tags} 个标签` : "";
+    const fetchedAt = data.fetchedAt ? new Date(data.fetchedAt).toLocaleDateString("zh-CN") : "—";
+    showModel(
+      model,
+      entry.repo,
+      `${entry.label} 内置快照 · ${model.commits.length} 个提交${tagNote} · 抓取于 ${fetchedAt}`
+    );
+    refreshCacheStatus(entry.repo);
+  } catch (error: any) {
+    showError(formatErrorForUI(error));
+  } finally {
+    state.isLoading = false;
+  }
+}
+
+/**
+ * 加载预置（演示数据，纯本地构造）
  */
 async function loadPreset(index: number) {
   try {
@@ -233,26 +290,13 @@ async function loadPreset(index: number) {
 
     const preset = PRESETS[index];
     const model = preset.load();
-    const scene = buildScene(model);
 
-    state.model = model;
     state.fromCache = false;
     state.cacheSavedAt = null;
     currentRepoFull = "";
 
-    const r = ensureRenderer();
-    if (!r) return;
-    r.setScene(scene);
-
-    pausePlayback();
-    state.currentTime = 0;
-    infoPanel.show(null);
-
-    showStatus(`已加载 ${model.commits.length} 个提交`);
+    showModel(model, "", `已加载 ${model.commits.length} 个提交（演示数据）`);
     refreshCacheStatus("");
-    showCanvas();
-    startPlayback();
-    render();
   } catch (error: any) {
     showError(formatErrorForUI(error));
   } finally {
@@ -271,7 +315,13 @@ function startPlayback() {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = null;
   }
+  // 已播到末尾时再次播放：从头开始，否则会立刻结束
+  if (state.currentTime >= state.duration) {
+    state.currentTime = 0;
+    render();
+  }
   state.isPlaying = true;
+  syncPlayButton();
   const startTime = performance.now();
   const startOffset = state.currentTime;
 
@@ -283,6 +333,7 @@ function startPlayback() {
       state.currentTime = state.duration;
       state.isPlaying = false;
       animationFrameId = null;
+      syncPlayButton();
       render();
       return;
     }
@@ -307,6 +358,14 @@ function pausePlayback() {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = null;
   }
+  syncPlayButton();
+}
+
+/** 同步播放/暂停开关的外观 */
+function syncPlayButton() {
+  if (!playPauseBtn) return;
+  playPauseBtn.textContent = state.isPlaying ? "⏸ 暂停" : "▶ 播放";
+  playPauseBtn.classList.toggle("is-playing", state.isPlaying);
 }
 
 /**
@@ -396,9 +455,9 @@ canvas.addEventListener("pointerup", (e) => {
   if (!pointerDown || !renderer) return;
   const dx = e.clientX - pointerDown.x;
   const dy = e.clientY - pointerDown.y;
-  const dt = performance.now() - pointerDown.time;
   pointerDown = null;
-  if (Math.hypot(dx, dy) > 6 || dt > 500) return; // 拖拽，不当点击
+  // 仅按位移判定拖拽（原先还限制 500ms，慢速点击会被误判为拖拽而不响应）
+  if (Math.hypot(dx, dy) > 6) return;
 
   const hit = renderer.pick(e.clientX, e.clientY);
   if (!hit) {
@@ -725,7 +784,7 @@ async function exportCard() {
     // 底部
     cardCtx.fillStyle = "#5d6580";
     cardCtx.font = "12px 'PingFang SC', 'Microsoft YaHei', sans-serif";
-    cardCtx.fillText("由代码年轮生成 · https://github.com/yourusername/gittree", 50, 1320);
+    cardCtx.fillText("由代码年轮生成 · https://github.com/dongfangzhizhu/gittree", 50, 1320);
 
     // 下载
     cardCanvas.toBlob((blob) => {
@@ -755,8 +814,11 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 // ==================== 事件监听 ====================
 
 loadBtn.addEventListener("click", loadRepository);
-playBtn.addEventListener("click", () => startPlayback());
-pauseBtn.addEventListener("click", () => pausePlayback());
+// 播放/暂停合并开关：按当前状态切换
+playPauseBtn.addEventListener("click", () => {
+  if (state.isPlaying) pausePlayback();
+  else startPlayback();
+});
 if (cancelBtn) {
   cancelBtn.addEventListener("click", () => {
     if (loadAbortController) {
@@ -827,18 +889,92 @@ function clearError() {
   errorBox.style.display = "none";
 }
 
+/** 内置快照条目（public/snapshots/index.json） */
+interface SnapshotEntry {
+  repo: string;
+  label: string;
+  description: string;
+  file: string;
+  commits?: number;
+  tags?: number;
+  tagsTotal?: number;
+  fetchedAt?: number;
+  sampled?: boolean;
+  tagsError?: string | null;
+}
+
 /**
- * 初始化预置
+ * 初始化预置：演示数据 + 精选真实仓库（内置快照）
  */
 function initPresets() {
   presetsContainer.innerHTML = "";
+
+  const demoGroup = document.createElement("div");
+  demoGroup.className = "preset-group";
+  const demoTitle = document.createElement("div");
+  demoTitle.className = "preset-group-title";
+  demoTitle.textContent = "演示";
+  const demoGrid = document.createElement("div");
+  demoGrid.className = "presets-grid";
+
   for (let i = 0; i < PRESETS.length; i++) {
     const preset = PRESETS[i];
     const card = document.createElement("div");
     card.className = "preset-card";
     card.innerHTML = `<div>${preset.name}</div><strong>${preset.description}</strong>`;
     card.addEventListener("click", () => loadPreset(i));
-    presetsContainer.appendChild(card);
+    demoGrid.appendChild(card);
+  }
+  demoGroup.append(demoTitle, demoGrid);
+  presetsContainer.appendChild(demoGroup);
+
+  void initSnapshots();
+}
+
+/**
+ * 加载内置快照索引并渲染精选仓库卡片
+ * 快照是可选加速项：读取失败时在状态栏说明，不阻断主流程
+ */
+async function initSnapshots() {
+  try {
+    const res = await fetch("snapshots/index.json");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const list: SnapshotEntry[] = Array.isArray(data.snapshots) ? data.snapshots : [];
+    if (list.length === 0) return;
+
+    const group = document.createElement("div");
+    group.className = "preset-group";
+    const title = document.createElement("div");
+    title.className = "preset-group-title";
+    title.textContent = "精选真实仓库（内置快照，无需等待 API）";
+    const grid = document.createElement("div");
+    grid.className = "presets-grid";
+
+    for (const entry of list) {
+      const card = document.createElement("div");
+      card.className = "preset-card snapshot-card";
+      const name = document.createElement("div");
+      name.textContent = entry.label;
+      const desc = document.createElement("strong");
+      desc.textContent = entry.description;
+      const meta = document.createElement("span");
+      meta.className = "preset-meta";
+      const tagNote =
+        entry.tagsTotal && entry.tagsTotal > 0
+          ? `${entry.tags ?? 0}/${entry.tagsTotal} 标签`
+          : "无标签";
+      meta.textContent = `${entry.commits ?? "?"} 提交 · ${tagNote}`;
+      card.append(name, desc, meta);
+      card.addEventListener("click", () => loadSnapshot(entry));
+      grid.appendChild(card);
+    }
+
+    group.append(title, grid);
+    presetsContainer.appendChild(group);
+  } catch (error: any) {
+    console.warn("内置快照索引加载失败：", error?.message || error);
+    showStatus("内置快照不可用（不影响手动加载仓库）");
   }
 }
 
@@ -871,9 +1007,13 @@ initFromURL();
     lanes: state.model?.lanes.length ?? 0,
     chapters: state.model?.chapters.map((c) => c.title) ?? [],
     segments: renderer?.stats().segments ?? 0,
+    branches: renderer?.stats().branches ?? 0,
     leaves: renderer?.stats().leaves ?? 0,
     flowers: renderer?.stats().fruits ?? 0,
     fruits: renderer?.stats().fruits ?? 0,
+    isPlaying: state.isPlaying,
+    currentTime: state.currentTime,
+    duration: state.duration,
     firstCommitTime: state.model?.commits[0]?.time ?? null,
     lastCommitTime: state.model?.commits[state.model?.commits.length - 1]?.time ?? null,
     commitTimeAt: (idx: number) => state.model?.commits[idx]?.time ?? null,

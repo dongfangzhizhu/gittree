@@ -59,6 +59,16 @@
       justify-content: space-between;
       gap: 16px;
       flex-wrap: wrap;
+      /* 吸顶：滚到树下也能随时导出 */
+      position: sticky;
+      top: 0;
+      z-index: 60;
+      padding: 10px 0 12px;
+      margin: -10px 0 -4px;
+      background: linear-gradient(180deg, rgba(10, 14, 39, 0.96) 55%, rgba(10, 14, 39, 0.7));
+      backdrop-filter: blur(16px) saturate(140%);
+      -webkit-backdrop-filter: blur(16px) saturate(140%);
+      border-bottom: 1px solid rgba(126, 240, 230, 0.08);
     }
 
     .brand {
@@ -86,6 +96,14 @@
       color: var(--dim);
       margin-top: 2px;
       letter-spacing: 0.4px;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }
 
     .top-actions a {
@@ -322,8 +340,27 @@
 
     /* ===== 预置 ===== */
     .presets {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .preset-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .preset-group-title {
+      font-size: 12px;
+      color: var(--dim);
+      letter-spacing: 0.6px;
+      padding-left: 2px;
+    }
+
+    .presets-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
       gap: 12px;
     }
 
@@ -353,6 +390,18 @@
       font-size: 12px;
       color: var(--dim);
       font-weight: 400;
+    }
+
+    .preset-meta {
+      display: block;
+      margin-top: 7px;
+      font-size: 11px;
+      color: var(--accent);
+      opacity: 0.85;
+    }
+
+    .preset-card.snapshot-card {
+      background: linear-gradient(150deg, rgba(78, 205, 196, 0.06), rgba(255, 255, 255, 0.02));
     }
 
     /* ===== 舞台 ===== */
@@ -646,20 +695,28 @@
       text-align: center;
     }
 
-    /* ===== 导出区 ===== */
+    /* ===== 导出区（顶栏） ===== */
     .export-area {
       display: none;
-      gap: 10px;
-      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
     }
 
     .export-area button {
+      padding: 9px 15px;
+      font-size: 13px;
       background: linear-gradient(135deg, #f5b942, #e67e22);
       color: #3a2000;
     }
 
     .export-area button:hover:not(:disabled) {
       box-shadow: 0 8px 20px rgba(230, 126, 34, 0.3);
+    }
+
+    /* 播放/暂停合并开关：固定宽度避免图标切换抖动 */
+    .play-toggle {
+      min-width: 98px;
+      text-align: center;
     }
 
     footer {
@@ -735,7 +792,11 @@
         </div>
       </div>
       <div class="top-actions">
-        <a href="https://github.com/yourusername/gittree" target="_blank" rel="noopener">GitHub ↗</a>
+        <div class="export-area" id="exportArea">
+          <button data-action="export-video" title="导出为 WebM 视频">📽 导出视频</button>
+          <button data-action="export-card" title="导出为 PNG 纪念卡">🎴 导出纪念卡</button>
+        </div>
+        <a href="https://github.com/dongfangzhizhu/gittree" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </header>
 
@@ -806,8 +867,7 @@
       </div>
 
       <div class="controls" id="controls">
-        <button id="playBtn">▶ 播放</button>
-        <button id="pauseBtn" class="ghost">⏸ 暂停</button>
+        <button id="playPauseBtn" class="play-toggle" title="空格键切换">⏸ 暂停</button>
         <input type="range" id="timeSlider" min="0" max="100" value="0" aria-label="生长进度" />
         <span id="timeDisplay" class="time-display">00:00</span>
         <div class="control-group">
@@ -828,16 +888,11 @@
           </select>
         </div>
       </div>
-
-      <div class="export-area" id="exportArea">
-        <button data-action="export-video" title="导出为 WebM 视频">📽 导出视频</button>
-        <button data-action="export-card" title="导出为 PNG 纪念卡">🎴 导出纪念卡</button>
-      </div>
     </main>
 
     <footer>
       <p>快捷键：<kbd>空格</kbd> 播放/暂停 · <kbd>←</kbd><kbd>→</kbd> 进度 · <kbd>Home</kbd>/<kbd>End</kbd> 跳转首尾</p>
-      <p>代码年轮 © 2026 · 数据来自 GitHub REST API · <a href="https://github.com/yourusername/gittree" target="_blank" rel="noopener">GitHub</a></p>
+      <p>代码年轮 © 2026 · 数据来自 GitHub REST API · <a href="https://github.com/dongfangzhizhu/gittree" target="_blank" rel="noopener">GitHub</a></p>
     </footer>
   </div>
 

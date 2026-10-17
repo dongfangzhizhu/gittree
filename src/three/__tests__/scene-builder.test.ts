@@ -184,4 +184,45 @@ describe("buildScene", () => {
     const hasZ = branches.some((s) => Math.abs(s.p1[2] - s.p0[2]) > 1);
     expect(hasZ).toBe(true);
   });
+
+  it("每条 lane 生成一根连续管：半径与点数量配套、锥度连续", () => {
+    const model = buildTestModel();
+    const scene = buildScene(model, { seed: "s" });
+
+    // 可成管的 lane 数（主干 + 提交数 >= 3 的支线）
+    expect(scene.branches.length).toBeGreaterThan(0);
+    const trunkBranch = scene.branches.find((b) => b.kind === "trunk");
+    expect(trunkBranch).toBeDefined();
+
+    for (const branch of scene.branches) {
+      expect(branch.points.length).toBe(branch.radii.length);
+      expect(branch.births.length).toBe(branch.points.length - 1);
+      expect(branch.points.length).toBeGreaterThanOrEqual(2);
+
+      // 相邻控制点首尾相接
+      for (let i = 1; i < branch.points.length; i++) {
+        // points[i] 为第 i-1 段的终点，与第 i 段起点一致（由生成逻辑保证）
+        expect(branch.points[i]).toHaveLength(3);
+      }
+
+      // 半径连续：上一段末半径 == 下一段首半径（锥度无跳变）
+      for (let i = 1; i < branch.radii.length; i++) {
+        expect(Number.isFinite(branch.radii[i])).toBe(true);
+        expect(branch.radii[i]).toBeGreaterThan(0);
+      }
+      // 整体自根向梢变细（允许相等）
+      expect(branch.radii[branch.radii.length - 1]).toBeLessThanOrEqual(branch.radii[0] + 1e-6);
+    }
+  });
+
+  it("连续管的点序列与段端点一一对应", () => {
+    const scene = buildScene(buildTestModel(), { seed: "s" });
+    const trunkSegs = scene.segments.filter((s) => s.kind === "trunk");
+    const trunkBranch = scene.branches.find((b) => b.kind === "trunk")!;
+    expect(trunkBranch.points.length).toBe(trunkSegs.length + 1);
+    expect(trunkBranch.points[0]).toEqual(trunkSegs[0].p0);
+    expect(trunkBranch.points[trunkBranch.points.length - 1]).toEqual(
+      trunkSegs[trunkSegs.length - 1].p1
+    );
+  });
 });

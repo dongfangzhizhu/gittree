@@ -13,7 +13,8 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import { ThreeScene, SceneSegment, SceneLeaf, SceneFruit } from "./scene-types";
+import { ThreeScene, SceneSegment, SceneLeaf, SceneFruit, SceneBranch } from "./scene-types";
+import { buildBranchGeometry, visibleRingCount } from "./branch-geometry";
 
 /** 叶子调色板（索引 12 = 紫色，spec:/hook: 提交；与二维版一致） */
 const LEAF_COLORS = [
@@ -36,19 +37,25 @@ const FALL_DURATION = 0.06;
  * 叶/果的基础半径只有 0.3–1.6 单位，直接渲染不足 1px。
  * 放大到肉眼可见、可点击的尺寸（直径约 8–26 单位）。
  */
-const LEAF_SCALE = 8;
-const FRUIT_SCALE = 5.5;
+const LEAF_SCALE = 11;
+const FRUIT_SCALE = 7;
 
 export type ViewName = "overview" | "side" | "top" | "root";
 
-interface SegmentEntry {
+interface BranchEntry {
+  branch: SceneBranch;
+  mesh: THREE.Mesh;
+  ringBirths: number[];
+  indicesPerRing: number;
+  ringCount: number;
+  sideIndexCount: number;
+  fullIndexCount: number;
+}
+
+interface GraftEntry {
   seg: SceneSegment;
   mesh: THREE.Mesh;
-  /** 单位方向 */
-  dir: THREE.Vector3;
-  len: number;
-  /** graft 用： TubeGeometry 的环数 */
-  rings?: number;
+  rings: number;
 }
 
 interface LeafGroup {
@@ -89,7 +96,8 @@ export class TreeRenderer {
   readonly controls: OrbitControls;
 
   private scene3d: ThreeScene | null = null;
-  private segmentEntries: SegmentEntry[] = [];
+  private branchEntries: BranchEntry[] = [];
+  private graftEntries: GraftEntry[] = [];
   private leafGroups: LeafGroup[] = [];
   private fruitGroups: FruitGroup[] = [];
   private pickMeshes: THREE.Mesh[] = [];
@@ -117,6 +125,14 @@ export class TreeRenderer {
   private tmpVec = new THREE.Vector3();
   private tmpScale = new THREE.Vector3();
   private upVector = new THREE.Vector3(0, 1, 0);
+  /** 最近一次 updateTree 的时间点（判定节点是否可见） */
+  private lastT = 0;
+  /** 待取景标记：setScene 后等首个真实画幅再算机位 */
+  private needsFrame = true;
+  /** 空闲驱动循环句柄（相机过渡 / 自动旋转） */
+  private idleRaf: number | null = null;
+  /** 需要持续出帧到的时刻（拖拽/滚轮后的阻尼收敛） */
+  private renderUntil = 0;
 
   constructor(canvas: HTMLCanvasElement, options: TreeRendererOptions = {}) {
     this.renderer = new THREE.WebGLRenderer({
@@ -143,6 +159,14 @@ export class TreeRenderer {
     this.controls.maxPolarAngle = 1.53; // 不钻到地面以下
     this.controls.autoRotateSpeed = 0.7;
 
+    // 暂停时也要能拖动/缩放：交互期间按需出帧（含阻尼收敛）
+    const wake = () => this.requestFrames(450);
+    const el = this.renderer.domElement;
+    el.addEventListener("pointerdown", wake);
+    el.addEventListener("pointermove", wake);
+    el.addEventListener("wheel", wake, { passive: true });
+    el.addEventListener("touchmove", wake, { passive: true });
+
     this.setupLights();
   }
 
@@ -167,27 +191,58 @@ export class TreeRenderer {
 
     this.buildGround(scene.radius);
     this.buildStars();
-    this.buildSegments(scene);
+    this.buildBranches(scene);
+    this.buildGrafts(scene);
     this.buildLeaves(scene);
     this.buildFruits(scene);
     this.buildSelectionMarker();
 
-    // 初始取景：由场景尺度推导的默认机位
-    const target = new THREE.Vector3(0, scene.height * 0.42, 0);
-    this.controls.target.copy(target);
-    const dist = scene.radius * 1.35 + 320;
-    this.camera.position.set(dist * 0.72, scene.height * 0.95, dist * 0.72);
+    // 初始取景：等第一次拿到真实画幅后再算（见 resize → frameScene）
+    this.needsFrame = true;
+    this.frameScene();
     this.camAnim = null;
     this.controls.update();
   }
 
+  /**
+   * 在当前 fov 与画幅下装下整棵树所需的相机距离。
+   * 树高 800+、宽 400+，用固定距离必然裁切，故按 fov 反算。
+   */
+  private fitDistance(margin = 1.1): number {
+    const s = this.scene3d;
+    if (!s) return 1200;
+    const tanV = Math.tan((this.camera.fov * Math.PI) / 360);
+    const tanH = tanV * Math.max(0.55, this.camera.aspect);
+    const halfH = Math.max(s.height * 0.55, 120);
+    const halfW = Math.max(s.radius * 1.15, s.height * 0.2);
+    return Math.max(halfH / tanV, halfW / tanH) * margin;
+  }
+
+  /** 默认机位：正对整棵树，略高俯视 */
+  private frameScene(): void {
+    const s = this.scene3d;
+    if (!s) return;
+    const target = new THREE.Vector3(0, s.height * 0.5, 0);
+    const dist = this.fitDistance();
+    const dir = new THREE.Vector3(0.68, 0.36, 0.68).normalize();
+    this.controls.target.copy(target);
+    this.camera.position.copy(target).addScaledVector(dir, dist);
+    this.controls.update();
+  }
+
   private clearScene(): void {
-    for (const entry of this.segmentEntries) {
+    for (const entry of this.branchEntries) {
       this.scene.remove(entry.mesh);
       entry.mesh.geometry.dispose();
       (entry.mesh.material as THREE.Material).dispose();
     }
-    this.segmentEntries = [];
+    this.branchEntries = [];
+    for (const entry of this.graftEntries) {
+      this.scene.remove(entry.mesh);
+      entry.mesh.geometry.dispose();
+      (entry.mesh.material as THREE.Material).dispose();
+    }
+    this.graftEntries = [];
     for (const group of this.leafGroups) {
       this.scene.remove(group.mesh);
       group.mesh.geometry.dispose();
@@ -299,49 +354,61 @@ export class TreeRenderer {
     this.scene.add(this.stars);
   }
 
-  /** 枝干：每段一个锥形圆柱（保留 w0→w1 锥度）；嫁接弧用 TubeGeometry + drawRange 生长 */
-  private buildSegments(scene: ThreeScene): void {
+  /**
+   * 枝干：每条 lane 一根连续管状网格（CatmullRom 平滑 + 平行传输标架 + 连续锥度），
+   * 彻底消除「多段圆柱拼接」的接缝与折痕
+   */
+  private buildBranches(scene: ThreeScene): void {
+    for (const branch of scene.branches) {
+      const built = buildBranchGeometry(branch);
+      if (built.ringCount === 0) continue;
+
+      const color = branch.kind === "trunk" ? TRUNK_COLOR : BRANCH_COLOR;
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.92,
+        metalness: 0,
+      });
+      const mesh = new THREE.Mesh(built.geometry, mat);
+      mesh.frustumCulled = false;
+      // 初始全部隐藏，由 updateTree 按出生时间揭示
+      built.geometry.setDrawRange(0, 0);
+      this.scene.add(mesh);
+
+      this.branchEntries.push({
+        branch,
+        mesh,
+        ringBirths: built.ringBirths,
+        indicesPerRing: built.indicesPerRing,
+        ringCount: built.ringCount,
+        sideIndexCount: built.sideIndexCount,
+        fullIndexCount: built.fullIndexCount,
+      });
+    }
+  }
+
+  /** 嫁接弧：merge 处的二次贝塞尔细管，按 drawRange 生长 */
+  private buildGrafts(scene: ThreeScene): void {
     for (const seg of scene.segments) {
-      if (seg.kind === "graft") {
-        const ctrl = seg.ctrl ?? [
-          (seg.p0[0] + seg.p1[0]) / 2,
-          (seg.p0[1] + seg.p1[1]) / 2 + 40,
-          (seg.p0[2] + seg.p1[2]) / 2,
-        ];
-        const curve = new THREE.QuadraticBezierCurve3(
-          new THREE.Vector3(...seg.p0),
-          new THREE.Vector3(...ctrl),
-          new THREE.Vector3(...seg.p1)
-        );
-        const rings = 14;
-        const geo = new THREE.TubeGeometry(curve, rings, 1.6, 6, false);
-        const mat = new THREE.MeshStandardMaterial({ color: GRAFT_COLOR, roughness: 0.95 });
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.frustumCulled = false;
-        this.scene.add(mesh);
-        this.segmentEntries.push({
-          seg,
-          mesh,
-          dir: new THREE.Vector3(),
-          len: 1,
-          rings,
-        });
-        continue;
-      }
-
-      const dir = new THREE.Vector3(...seg.p1).sub(new THREE.Vector3(...seg.p0));
-      const len = dir.length() || 0.001;
-      dir.normalize();
-
-      // 单位高度圆柱，底部（w0）在原点，顶部（w1）在 +1
-      const geo = new THREE.CylinderGeometry(seg.w1, seg.w0, 1, 7, 1, false);
-      geo.translate(0, 0.5, 0);
-      const color = seg.kind === "trunk" ? TRUNK_COLOR : BRANCH_COLOR;
-      const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.95 });
+      if (seg.kind !== "graft") continue;
+      const ctrl = seg.ctrl ?? [
+        (seg.p0[0] + seg.p1[0]) / 2,
+        (seg.p0[1] + seg.p1[1]) / 2 + 40,
+        (seg.p0[2] + seg.p1[2]) / 2,
+      ];
+      const curve = new THREE.QuadraticBezierCurve3(
+        new THREE.Vector3(...seg.p0),
+        new THREE.Vector3(...ctrl),
+        new THREE.Vector3(...seg.p1)
+      );
+      const rings = 14;
+      const geo = new THREE.TubeGeometry(curve, rings, 1.5, 6, false);
+      geo.setDrawRange(0, 0);
+      const mat = new THREE.MeshStandardMaterial({ color: GRAFT_COLOR, roughness: 0.95 });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.frustumCulled = false;
       this.scene.add(mesh);
-      this.segmentEntries.push({ seg, mesh, dir, len });
+      this.graftEntries.push({ seg, mesh, rings });
     }
   }
 
@@ -450,9 +517,28 @@ export class TreeRenderer {
   updateTree(t: number): void {
     const scene = this.scene3d;
     if (!scene) return;
+    this.lastT = t;
 
-    // 枝干生长
-    for (const entry of this.segmentEntries) {
+    // 枝干生长：按环序揭示索引（环序即时间序），保留连续管面
+    for (const entry of this.branchEntries) {
+      const visibleRings = visibleRingCount(entry.ringBirths, t);
+      if (visibleRings <= 0) {
+        entry.mesh.visible = false;
+        continue;
+      }
+      entry.mesh.visible = true;
+      if (visibleRings >= entry.ringCount) {
+        // 完全长成：连同端盖一起显示
+        entry.mesh.geometry.setDrawRange(0, entry.fullIndexCount);
+      } else {
+        // 环 i → 环 i+1 属于第 i 段侧面；显示 visibleRings-1 段
+        const bands = Math.max(0, visibleRings - 1);
+        entry.mesh.geometry.setDrawRange(0, bands * entry.indicesPerRing);
+      }
+    }
+
+    // 嫁接弧生长
+    for (const entry of this.graftEntries) {
       const [t0, t1] = entry.seg.birth;
       if (t < t0) {
         entry.mesh.visible = false;
@@ -464,21 +550,10 @@ export class TreeRenderer {
         continue;
       }
       entry.mesh.visible = true;
-
-      if (entry.seg.kind === "graft" && entry.rings) {
-        // TubeGeometry 顶点按环排列：每环 (radialSegments+1)=7 个顶点
-        const perRing = 7;
-        const rings = Math.max(1, Math.ceil(progress * entry.rings));
-        entry.mesh.geometry.setDrawRange(0, rings * perRing);
-        continue;
-      }
-
-      const len = entry.len * progress;
-      entry.mesh.scale.set(1, len, 1);
-      this.tmpVec.copy(entry.dir).multiplyScalar(len / 2).add(new THREE.Vector3(...entry.seg.p0));
-      entry.mesh.position.copy(this.tmpVec);
-      this.tmpQuat.setFromUnitVectors(this.upVector, entry.dir);
-      entry.mesh.quaternion.copy(this.tmpQuat);
+      // TubeGeometry 顶点按环排列：每环 (radialSegments+1)=7 个顶点
+      const perRing = 7;
+      const rings = Math.max(1, Math.ceil(progress * entry.rings));
+      entry.mesh.geometry.setDrawRange(0, rings * perRing);
     }
 
     // 叶子：生长、风动、落叶
@@ -585,26 +660,28 @@ export class TreeRenderer {
     const scene = this.scene3d;
     if (!scene) return;
     const h = scene.height;
-    const r = scene.radius;
+    const fit = this.fitDistance();
     let to: THREE.Vector3;
     let target: THREE.Vector3;
+    const place = (dir: THREE.Vector3, dist: number, tgt: THREE.Vector3) =>
+      tgt.clone().addScaledVector(dir.normalize(), dist);
     switch (name) {
       case "side":
-        to = new THREE.Vector3(r * 2.2 + 320, h * 0.55, r * 0.12 + 40);
         target = new THREE.Vector3(0, h * 0.5, 0);
+        to = place(new THREE.Vector3(1, 0.1, 0.16), fit, target);
         break;
       case "top":
-        to = new THREE.Vector3(0.01, h + 900, 0.01);
-        target = new THREE.Vector3(0, h * 0.3, 0);
+        target = new THREE.Vector3(0, h * 0.42, 0);
+        to = place(new THREE.Vector3(0.01, 1, 0.01), fit * 1.02, target);
         break;
       case "root":
-        to = new THREE.Vector3(r * 0.8 + 180, 170, r * 0.8 + 180);
-        target = new THREE.Vector3(0, h * 0.16, 0);
+        target = new THREE.Vector3(0, h * 0.14, 0);
+        to = place(new THREE.Vector3(0.72, 0.24, 0.72), fit * 0.46, target);
         break;
       case "overview":
       default:
-        to = new THREE.Vector3(r * 1.35 + 320, h * 0.95, r * 1.35 + 320);
-        target = new THREE.Vector3(0, h * 0.42, 0);
+        target = new THREE.Vector3(0, h * 0.5, 0);
+        to = place(new THREE.Vector3(0.68, 0.36, 0.68), fit, target);
         break;
     }
     this.flyTo(to, target);
@@ -631,16 +708,42 @@ export class TreeRenderer {
       start: performance.now(),
       dur: 900,
     };
+    // 暂停状态下主循环不跑帧，这里自带驱动，否则视角切换「点了没反应」
+    this.ensureIdleLoop();
+  }
+
+  /**
+   * 空闲驱动循环：播放暂停时也要让相机过渡/自动旋转/拖拽阻尼持续推进。
+   * 只在有实际动画需求时自我续帧，避免空转耗电。
+   */
+  private ensureIdleLoop(): void {
+    if (this.idleRaf !== null) return;
+    const tick = (now: number) => {
+      this.idleRaf = null;
+      this.render(now);
+      const active = this.camAnim || this.controls.autoRotate || now < this.renderUntil;
+      if (active) this.idleRaf = requestAnimationFrame(tick);
+    };
+    this.idleRaf = requestAnimationFrame(tick);
+  }
+
+  /** 请求在未来 ms 毫秒内持续出帧（拖拽/滚轮后让阻尼走完） */
+  private requestFrames(ms = 400): void {
+    this.renderUntil = Math.max(this.renderUntil, performance.now() + ms);
+    this.ensureIdleLoop();
   }
 
   setAutoRotate(on: boolean): void {
     this.controls.autoRotate = on;
+    if (on) this.ensureIdleLoop();
   }
 
   /**
    * 射线拾取：屏幕坐标 → 叶子/果实节点
+   * 先做精确射线检测；未命中时退化为「屏幕就近拾取」，
+   * 保证任意视角、任意远近、播放或暂停状态都能稳定点中节点。
    */
-  pick(clientX: number, clientY: number): NodeHit | null {
+  pick(clientX: number, clientY: number, tolerancePx = 18): NodeHit | null {
     if (this.pickMeshes.length === 0) return null;
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
@@ -662,7 +765,54 @@ export class TreeRenderer {
         if (item) return { kind: "fruit", item, point: hit.point.clone() };
       }
     }
-    return null;
+    return this.pickNearest(clientX, clientY, tolerancePx);
+  }
+
+  /** 屏幕就近拾取（只考虑当前已出现的节点） */
+  private pickNearest(clientX: number, clientY: number, maxPx: number): NodeHit | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    let bestScore = Infinity;
+    let best: NodeHit | null = null;
+
+    const project = (pos: readonly number[]): { x: number; y: number } | null => {
+      this.tmpVec.set(pos[0], pos[1], pos[2]).project(this.camera);
+      if (this.tmpVec.z > 1) return null; // 相机背后
+      const x = rect.left + ((this.tmpVec.x + 1) / 2) * rect.width;
+      const y = rect.top + ((-this.tmpVec.y + 1) / 2) * rect.height;
+      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null;
+      return { x, y };
+    };
+
+    const consider = (kind: "leaf" | "fruit", item: SceneLeaf | SceneFruit, weight: number) => {
+      const p = project(item.pos);
+      if (!p) return;
+      const d = Math.hypot(p.x - clientX, p.y - clientY);
+      if (d > maxPx) return;
+      const score = d * weight;
+      if (score < bestScore) {
+        bestScore = score;
+        best =
+          kind === "leaf"
+            ? { kind: "leaf", item: item as SceneLeaf, point: new THREE.Vector3(...item.pos) }
+            : { kind: "fruit", item: item as SceneFruit, point: new THREE.Vector3(...item.pos) };
+      }
+    };
+
+    for (const group of this.leafGroups) {
+      for (const leaf of group.items) {
+        if (this.lastT < leaf.birth) continue; // 尚未长出
+        if (leaf.fallAt !== undefined && this.lastT > leaf.fallAt + FALL_DURATION) continue; // 已落尽
+        consider("leaf", leaf, 1);
+      }
+    }
+    for (const group of this.fruitGroups) {
+      for (const fruit of group.items) {
+        if (this.lastT < fruit.birth) continue;
+        consider("fruit", fruit, 0.9); // 果实体积更大，同距离优先
+      }
+    }
+    return best;
   }
 
   /** 按 key（leaf-/fruit- 前缀的 id）查找节点世界坐标 */
@@ -788,12 +938,18 @@ export class TreeRenderer {
     this.renderer.setSize(width, height, false);
     this.camera.aspect = width / Math.max(1, height);
     this.camera.updateProjectionMatrix();
+    // 首帧拿到真实画幅后重新取景，避免默认 16/9 估算导致裁切
+    if (this.needsFrame) {
+      this.needsFrame = false;
+      this.frameScene();
+    }
   }
 
   /** 场景统计（调试/测试钩子） */
-  stats(): { segments: number; leaves: number; fruits: number } {
+  stats(): { segments: number; branches: number; leaves: number; fruits: number } {
     return {
       segments: this.scene3d?.segments.length ?? 0,
+      branches: this.scene3d?.branches.length ?? 0,
       leaves: this.scene3d?.leaves.length ?? 0,
       fruits: this.scene3d?.fruits.length ?? 0,
     };

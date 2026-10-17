@@ -11,6 +11,7 @@ import { seededRandom } from "../layout/prng";
 import {
   ThreeScene,
   SceneSegment,
+  SceneBranch,
   SceneLeaf,
   SceneFruit,
   Vec3,
@@ -21,10 +22,16 @@ const MAX_RISE = 820; // 树冒高度上限
 const TRUNK_SEG_LEN = { min: 3, max: 40 };
 const BRANCH_SEG_LEN = { min: 3, max: 55 };
 const BRANCH_ANGLE_RANGE = { minDeg: 25, maxDeg: 60 }; // 支线仰角 25°–60°
+/** 每深一级，枝条长度按此比例收缩（0.78³ ≈ 0.47） */
+const BRANCH_DEPTH_SHRINK = 0.70;
+/** 每深一级，目标仰角再抬高的度数 */
+const BRANCH_DEPTH_RISE_DEG = 12;
+/** 枝条从基部到梢部额外上拱的度数 */
+const BRANCH_TIP_ARCH_DEG = 16;
 const TRUNK_SWAY_DEG = 7; // 主干每段偏摆 ±7°
 const BRANCH_SWAY_DEG = 5;
-const MIN_BRANCH_COMMITS = 3; // 少于此数的支线不单独分枝
-const THICKNESS = { base: 1.8, min: 1.5, max: 22 };
+const MIN_BRANCH_COMMITS = 2; // 少于此数的支线不单独分枝
+const THICKNESS = { base: 1.8, min: 1.5, max: 22, basalFlare: 1.5, flareDecay: 55 };
 
 /** 叶子颜色索引 12 = 紫色（spec:/hook: 提交） */
 export const LEAF_COLOR_KIRO = 12;
@@ -59,6 +66,7 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     return {
       seed,
       segments: [],
+      branches: [],
       leaves: [],
       fruits: [],
       chapters: [],
@@ -81,6 +89,7 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     commitCount <= 1 ? 0 : idx / (commitCount - 1);
 
   const segments: SceneSegment[] = [];
+  const branches: SceneBranch[] = [];
   const leaves: SceneLeaf[] = [];
   const fruits: SceneFruit[] = [];
 
@@ -118,12 +127,25 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     return laneId % 2 === 1 ? -1 : 1;
   };
 
+  // 分枝层级：主干 0，直接分出的 1，二级枝 2……（越深越短、越向上，避免树冠横向无限扩张）
+  const laneById = new Map(lanes.map((l) => [l.id, l]));
+  const depthOf = (laneId: number): number => {
+    let depth = 0;
+    let cur = laneById.get(laneId);
+    while (cur && cur.parentLane !== null && cur.parentLane !== undefined && depth < 6) {
+      cur = laneById.get(cur.parentLane);
+      depth++;
+    }
+    return depth;
+  };
+
   lanes.forEach((lane) => {
     const laneCommits = laneCommitsOf(lane);
     if (laneCommits.length === 0) return;
 
     const isTrunk = lane.id === 0;
     const isBranchable = isTrunk || laneCommits.length >= MIN_BRANCH_COMMITS;
+    const depth = isTrunk ? 0 : depthOf(lane.id);
 
     // 起点
     let p: Vec3 = [0, 0, 0];
@@ -134,15 +156,25 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
 
     const segLen = isTrunk
       ? clamp(MAX_RISE / laneCommits.length, TRUNK_SEG_LEN.min, TRUNK_SEG_LEN.max)
-      : clamp((MAX_RISE * 0.75) / laneCommits.length, BRANCH_SEG_LEN.min, BRANCH_SEG_LEN.max);
+      : clamp(
+          (MAX_RISE * 0.75 * Math.pow(BRANCH_DEPTH_SHRINK, depth)) / laneCommits.length,
+          BRANCH_SEG_LEN.min,
+          BRANCH_SEG_LEN.max
+        );
 
     // 初始方向：主干竖直向上；支线由仰角 + 方位角确定
     let dir: Vec3 = [0, 1, 0];
+    /** 本枝的目标仰角（弧度）：后续每段都向它回归 */
+    let baseElevation = Math.PI / 2;
     if (!isTrunk) {
       const side = sideOf(lane.forkCommitId, lane.id);
       const r = seededRandom(`${seed}:lane:${lane.id}`, 0);
-      const magDeg = BRANCH_ANGLE_RANGE.minDeg + r * (BRANCH_ANGLE_RANGE.maxDeg - BRANCH_ANGLE_RANGE.minDeg);
-      const elevation = (magDeg * Math.PI) / 180;
+      const magDeg =
+        BRANCH_ANGLE_RANGE.minDeg +
+        r * (BRANCH_ANGLE_RANGE.maxDeg - BRANCH_ANGLE_RANGE.minDeg) +
+        depth * BRANCH_DEPTH_RISE_DEG; // 二级以上枝条更向上收，避免树冠摊平
+      const elevation = (Math.min(magDeg, 78) * Math.PI) / 180;
+      baseElevation = elevation;
       // 方位角：侧向 ±90° 为基础，加种子扰动，使支线绕主干散开
       const azimuth = (side * Math.PI) / 2 + (seededRandom(`${seed}:lane-az:${lane.id}`, 1) * 2 - 1) * 0.9;
       dir = vNorm([
@@ -151,6 +183,11 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
         Math.sin(azimuth) * Math.cos(elevation),
       ]);
     }
+
+    // 连续管的控制点（首点为 lane 起点，后续每段追加终点）
+    const branchPoints: Vec3[] = [[...p] as Vec3];
+    const branchRadii: number[] = [];
+    const branchBirths: Array<[number, number]> = [];
 
     laneCommits.forEach((commit, i) => {
       // 确定性偏摆：在垂直于当前方向的平面上扰动（FR-TL：主干 ±7°）
@@ -161,8 +198,19 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
         // 主干保持向上生长趋势：轻度收敛水平分量（过强会把 ±7° 偏摆压成直线）
         dir = vNorm([dir[0] * 0.85, Math.max(dir[1], 0.55), dir[2] * 0.85]);
       } else {
-        // 支线略向上抬，避免垂下
-        dir = vNorm([dir[0], dir[1] + 0.06, dir[2]]);
+        // 支线：向本枝的初始仰角缓慢回归。
+        // 不能用「每段 +0.06 向上抬」——那是累加的，几十段后仰角会从 40° 爬到 80°，
+        // 枝条被拉成竖直的芦苇，失去树的形态。
+        const curElev = Math.asin(Math.max(-1, Math.min(1, dir[1])));
+        // 枝条越往外越向上拱（真实枝条末端朝上翘）
+        const arch = (i / Math.max(1, laneCommits.length - 1)) * ((BRANCH_TIP_ARCH_DEG * Math.PI) / 180);
+        const wanted = Math.min(baseElevation + arch, Math.PI / 2 - 0.05);
+        const elev = curElev + (wanted - curElev) * 0.08;
+        const hor = Math.hypot(dir[0], dir[2]);
+        if (hor > 1e-4) {
+          const cosE = Math.cos(elev);
+          dir = vNorm([(dir[0] / hor) * cosE, Math.sin(elev), (dir[2] / hor) * cosE]);
+        }
       }
 
       const p0 = p;
@@ -174,8 +222,15 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
 
       // 管道粗细（FR-TL-06）
       const subtree = laneCommits.length - i;
-      const w0 = clamp(THICKNESS.base * Math.sqrt(subtree), THICKNESS.min, THICKNESS.max);
-      const w1 = clamp(THICKNESS.base * Math.sqrt(Math.max(1, subtree - 1)), THICKNESS.min, THICKNESS.max);
+      let w0 = clamp(THICKNESS.base * Math.sqrt(subtree), THICKNESS.min, THICKNESS.max);
+      let w1 = clamp(THICKNESS.base * Math.sqrt(Math.max(1, subtree - 1)), THICKNESS.min, THICKNESS.max);
+
+      // 根颈膨大：主干底部指数衰减的加粗，有明显「扎进土里」的板根感
+      if (isTrunk) {
+        const flare = (y: number) => 1 + THICKNESS.basalFlare * Math.exp(-Math.max(0, y) / THICKNESS.flareDecay);
+        w0 *= flare(p0[1]);
+        w1 *= flare(p1[1]);
+      }
 
       if (isBranchable) {
         segments.push({
@@ -189,10 +244,25 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
           w1,
           birth: [t0, Math.min(1, Math.max(t1, t0 + 1e-6))],
         });
+        // 锥度连续：上一段的 w1 恰为下一段的 w0
+        if (branchRadii.length === 0) branchRadii.push(w0);
+        branchRadii.push(w1);
+        branchPoints.push(p1);
+        branchBirths.push([t0, Math.min(1, Math.max(t1, t0 + 1e-6))]);
       }
       tips.set(commit.id, p1);
       p = [...p1] as Vec3;
     });
+
+    if (branchBirths.length > 0) {
+      branches.push({
+        laneId: lane.id,
+        kind: isTrunk ? "trunk" : "branch",
+        points: branchPoints,
+        radii: branchRadii,
+        births: branchBirths,
+      });
+    }
   });
 
   // 叶子：每个非 merge 提交（FR-TL-07）
@@ -358,6 +428,7 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
   return {
     seed,
     segments,
+    branches,
     leaves,
     fruits,
     chapters,

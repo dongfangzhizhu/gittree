@@ -1,0 +1,41 @@
+{
+  "generatedAt": 1792237395849,
+  "snapshots": [
+    {
+      "repo": "facebook/react",
+      "label": "React",
+      "description": "前端框架 · 合并密集",
+      "file": "facebook__react.json",
+      "commits": 441,
+      "tags": 11,
+      "fetchedAt": 1792237354788,
+      "sampled": true,
+      "tagsTotal": 180,
+      "tagsError": null
+    },
+    {
+      "repo": "vuejs/core",
+      "label": "Vue 3",
+      "description": "渐进式框架 · 分支活跃",
+      "file": "vuejs__core.json",
+      "commits": 440,
+      "tags": 21,
+      "fetchedAt": 1792237362814,
+      "sampled": true,
+      "tagsTotal": 200,
+      "tagsError": null
+    },
+    {
+      "repo": "microsoft/TypeScript",
+      "label": "TypeScript",
+      "description": "编译器 · 十余年演进",
+      "file": "microsoft__TypeScript.json",
+      "commits": 490,
+      "tags": 10,
+      "fetchedAt": 1792237395827,
+      "sampled": true,
+      "tagsTotal": 240,
+      "tagsError": null
+    }
+  ]
+}

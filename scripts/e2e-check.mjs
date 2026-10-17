@@ -97,15 +97,24 @@ report(
 
 await page.screenshot({ path: resolve(OUT_DIR, "01-auto-play.png") });
 
-// 4. 暂停/播放
-await page.click("#pauseBtn");
+// 4. 播放/暂停（合并为单按钮）
+const labelPlaying = await page.evaluate(
+  () => document.getElementById("playPauseBtn")?.textContent?.trim() || ""
+);
+report("播放中按钮显示「暂停」", labelPlaying.includes("暂停"), labelPlaying);
+
+await page.click("#playPauseBtn");
 const tPaused1 = await page.evaluate(() => document.getElementById("timeDisplay")?.textContent);
 await page.waitForTimeout(1200);
 const tPaused2 = await page.evaluate(() => document.getElementById("timeDisplay")?.textContent);
+const labelPaused = await page.evaluate(
+  () => document.getElementById("playPauseBtn")?.textContent?.trim() || ""
+);
 report("暂停后时间停止", tPaused1 === tPaused2, `${tPaused1} → ${tPaused2}`);
+report("暂停后按钮显示「播放」", labelPaused.includes("播放"), labelPaused);
 await page.screenshot({ path: resolve(OUT_DIR, "02-paused.png") });
 
-await page.click("#playBtn");
+await page.click("#playPauseBtn");
 await page.waitForTimeout(1200);
 const tResumed = await page.evaluate(() => document.getElementById("timeDisplay")?.textContent);
 report("恢复播放后时间推进", tResumed !== tPaused2, `${tPaused2} → ${tResumed}`);
