@@ -451,7 +451,6 @@ function render() {
   }
   canvas.width = rect.width * window.devicePixelRatio;
   canvas.height = rect.height * window.devicePixelRatio;
-  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
 
   // 渲染
   renderFrame(ctx, state.geometry, t, {
@@ -543,6 +542,7 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+
 
 
 

@@ -86,11 +86,16 @@ function drawSegments(ctx: CanvasRenderingContext2D, geometry: TreeGeometry, t: 
     ctx.moveTo(x0, y0);
 
     // 沿贝塞尔曲线绘制
-    for (let p = 0; p <= progress; p += 0.02) {
+    for (let p = 0; p < progress; p += 0.02) {
       const px = bezier(x0, cx, x1, p);
       const py = bezier(y0, cy, y1, p);
       ctx.lineTo(px, py);
     }
+    
+    // 显式绘制最终点，确保曲线完整到终点
+    const pxFinal = bezier(x0, cx, x1, progress);
+    const pyFinal = bezier(y0, cy, y1, progress);
+    ctx.lineTo(pxFinal, pyFinal);
 
     ctx.stroke();
   }
@@ -182,3 +187,4 @@ function drawText(ctx: CanvasRenderingContext2D, geometry: TreeGeometry, t: numb
   const progress = Math.floor(t * 100);
   ctx.fillText(`Progress: ${progress}%`, 50, 80);
 }
+
