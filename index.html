@@ -157,6 +157,10 @@
       min-width: 100px;
     }
 
+    button#cancelBtn[style*="display: none"] {
+      display: none;
+    }
+
     select {
       padding: 8px 12px;
       background: rgba(255, 255, 255, 0.1);
@@ -296,6 +300,7 @@
           aria-label="GitHub 仓库地址"
         />
         <button id="loadBtn">让它生长</button>
+        <button id="cancelBtn" style="display: none;">⏹ 取消</button>
       </div>
       <div class="token-group">
         <input
@@ -359,3 +364,4 @@
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>
+

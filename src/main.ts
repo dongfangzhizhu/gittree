@@ -26,6 +26,9 @@ interface AppState {
   token?: string;
 }
 
+// 加载控制
+let loadAbortController: AbortController | null = null;
+
 const state: AppState = {
   isLoading: false,
   geometry: null,
@@ -61,6 +64,8 @@ const controls = document.getElementById("controls") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 const errorBox = document.getElementById("errorBox") as HTMLElement;
 const presetsContainer = document.getElementById("presets") as HTMLElement;
+const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement | null;
+const prevLine = document.getElementById("presets") as HTMLElement;
 
 const ctx = canvas.getContext("2d");
 let animationFrameId: number | null = null;
@@ -120,6 +125,7 @@ async function loadRepository() {
   try {
     state.isLoading = true;
     loadBtn.disabled = true;
+    if (cancelBtn) cancelBtn.style.display = "";
     showStatus("正在加载...");
     clearError();
 
@@ -128,7 +134,8 @@ async function loadRepository() {
 
     // 获取数据
     const source = new GitHubSource();
-    const signal = new AbortController().signal;
+    loadAbortController = new AbortController();
+const signal = loadAbortController.signal;
     const raw = await source.load(`${owner}/${repo}`, { token: tokenUI.getToken() }, signal);
 
     showStatus("正在处理数据...");
@@ -161,6 +168,8 @@ async function loadRepository() {
   } catch (error: any) {
     showError(formatErrorForUI(error));
   } finally {
+    loadAbortController = null;
+    if (cancelBtn) cancelBtn.style.display = "none";
     state.isLoading = false;
     loadBtn.disabled = false;
   }
@@ -191,6 +200,7 @@ async function loadPreset(index: number) {
   } catch (error: any) {
     showError(formatErrorForUI(error));
   } finally {
+    loadAbortController = null;
     state.isLoading = false;
   }
 }
@@ -493,6 +503,9 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+
+
+
 
 
 
