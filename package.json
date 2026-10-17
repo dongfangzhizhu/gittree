@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:e2e": "node scripts/e2e-check.mjs",
+    "test:forest": "node scripts/forest-test.mjs",
     "test:export": "node scripts/export-test.mjs",
     "test:interaction": "node scripts/interaction-test.mjs"
   },

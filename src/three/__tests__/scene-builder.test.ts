@@ -93,14 +93,23 @@ describe("buildScene", () => {
     }
   });
 
-  it("叶子数量 = 非 merge 提交数，颜色/形状按类型派生", () => {
+  it("每个非 merge 提交长出一簇叶，颜色/形状按类型派生", () => {
     const model = buildTestModel();
     const scene = buildScene(model, { seed: "s" });
-    const nonMerge = model.commits.filter((c) => !c.isMerge).length;
-    expect(scene.leaves).toHaveLength(nonMerge);
+    const nonMerge = model.commits.filter((c) => !c.isMerge);
+    // 叶簇：一个提交对应多片叶子（LEAVES_PER_CLUSTER），主叶 id 为 leaf-<idx>
+    expect(scene.leaves.length).toBeGreaterThanOrEqual(nonMerge.length);
+    expect(scene.leaves.length % nonMerge.length).toBe(0);
+    const leafedCommits = new Set(scene.leaves.map((l) => l.commitId));
+    expect(leafedCommits.size).toBe(nonMerge.length);
+    for (const commit of nonMerge) expect(leafedCommits.has(commit.id)).toBe(true);
+
     const specLeaf = scene.leaves.find((l) => l.commitId === "s1");
     expect(specLeaf?.shape).toBe("purple");
     expect(specLeaf?.colorIndex).toBe(12); // LEAF_COLOR_KIRO
+    // 同一提交的叶子共享落叶时刻（整簇一起飘落）
+    const cluster = scene.leaves.filter((l) => l.commitId === "s1");
+    expect(new Set(cluster.map((l) => String(l.fallAt))).size).toBe(1);
   });
 
   it("果实包含全部标签；主版本标记为 major", () => {

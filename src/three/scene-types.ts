@@ -24,6 +24,8 @@ export interface SceneSegment {
   birth: [number, number];
   /** 嫁接弧的二次贝塞尔控制点（仅 kind="graft"） */
   ctrl?: Vec3;
+  /** 所属树索引（森林模式；单树缺省 0） */
+  treeIndex?: number;
 }
 
 /** 叶子（一个非 merge 提交） */
@@ -41,6 +43,8 @@ export interface SceneLeaf {
   phase: number;
   /** 自转轴（确定性） */
   axis: Vec3;
+  /** 所属树索引（森林模式；单树缺省 0） */
+  treeIndex?: number;
 }
 
 /** 果实 / 花（标签或 spec/hook 痕迹） */
@@ -53,6 +57,8 @@ export interface SceneFruit {
   size: number;
   birth: number;
   kind: "major" | "normal" | "spec";
+  /** 所属树索引（森林模式；单树缺省 0） */
+  treeIndex?: number;
 }
 
 /** 一条枝干的连续折线（渲染时生成单根管状网格，避免逐段拼接的接缝） */
@@ -65,10 +71,14 @@ export interface SceneBranch {
   radii: number[];
   /** 每段的生长时间窗口，长度 = 段数 */
   births: Array<[number, number]>;
+  /** 所属树索引（森林模式；单树缺省 0） */
+  treeIndex?: number;
 }
 
 export interface SceneChapter {
   title: string;
+  /** 所属树索引（森林模式；单树缺省 0） */
+  treeIndex?: number;
   season: string;
   t0: number;
   t1: number;

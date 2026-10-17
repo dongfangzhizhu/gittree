@@ -56,3 +56,40 @@ export function parseGitHubInput(input: string): ParsedRepo {
     throw new Error("无法解析 GitHub 地址");
   }
 }
+
+export interface ParsedRepoList {
+  /** 去重后的 owner/repo */
+  repos: string[];
+  /** 解析失败的原始片段 */
+  invalid: string[];
+}
+
+/**
+ * 解析「多个仓库」输入：支持逗号、分号、空白、换行、顿号分隔。
+ * 单条解析失败不影响其它条目（记录在 invalid 里由调用方提示）。
+ */
+export function parseGitHubList(input: string): ParsedRepoList {
+  const parts = input
+    .split(/[,;，；、\s\n\r\t]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const repos: string[] = [];
+  const invalid: string[] = [];
+  const seen = new Set<string>();
+
+  for (const part of parts) {
+    try {
+      const { owner, repo } = parseGitHubInput(part);
+      const full = `${owner}/${repo}`;
+      if (!seen.has(full.toLowerCase())) {
+        seen.add(full.toLowerCase());
+        repos.push(full);
+      }
+    } catch {
+      invalid.push(part);
+    }
+  }
+
+  return { repos, invalid };
+}

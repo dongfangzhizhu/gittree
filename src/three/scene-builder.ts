@@ -19,20 +19,16 @@ import {
 
 /** 布局常量（与 FR-TL-02/03/04/06 对应，世界单位） */
 const MAX_RISE = 820; // 树冒高度上限
-const TRUNK_SEG_LEN = { min: 3, max: 40 };
-const BRANCH_SEG_LEN = { min: 3, max: 55 };
-const BRANCH_ANGLE_RANGE = { minDeg: 25, maxDeg: 60 }; // 支线仰角 25°–60°
-/** 每深一级，枝条长度按此比例收缩（0.78³ ≈ 0.47） */
+/** 每深一级，枝条长度按此比例收缩（0.7³ ≈ 0.34） */
 const BRANCH_DEPTH_SHRINK = 0.70;
-/** 每深一级，目标仰角再抬高的度数 */
-const BRANCH_DEPTH_RISE_DEG = 12;
-/** 枝条从基部到梢部额外上拱的度数 */
-const BRANCH_TIP_ARCH_DEG = 16;
-/** 一级枝条的最小伸展长度（世界单位），保证短 lane 也看得见 */
-const MIN_BRANCH_EXTENT = 90;
-const TRUNK_SWAY_DEG = 7; // 主干每段偏摆 ±7°
-const BRANCH_SWAY_DEG = 5;
-const MIN_BRANCH_COMMITS = 2; // 少于此数的支线不单独分枝
+/** 每深一级，目标仰角降低的度数（越深的枝越平展） */
+const BRANCH_DEPTH_FLATTEN_DEG = 9;
+/** 一级枝的伸展长度基准 = 树高 × 该系数（决定冠幅） */
+const LIMB_LEN_RATIO = 0.55;
+/** 每个提交长出的叶子数量（叶簇：单片叶太稀，看不出树冠） */
+const LEAVES_PER_CLUSTER = 9;
+/** 黄金角：让枝条绕主干均匀铺开，而不是挤在同一侧 */
+const GOLDEN_ANGLE = 2.399963229728653;
 const THICKNESS = { base: 2.2, min: 1.5, max: 30, basalFlare: 1.1, flareDecay: 50 };
 
 /** 叶子颜色索引 12 = 紫色（spec:/hook: 提交） */
@@ -118,17 +114,6 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
       .filter((c): c is Commit => c !== undefined)
       .sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
 
-  // 同一 fork 点的支线方位角交替（FR-TL-04 的三维版：左右 → 绕干交替）
-  const forkSideCount = new Map<string, number>();
-  const sideOf = (forkCommitId: string | null, laneId: number): number => {
-    if (forkCommitId) {
-      const n = forkSideCount.get(forkCommitId) || 0;
-      forkSideCount.set(forkCommitId, n + 1);
-      return n % 2 === 0 ? -1 : 1;
-    }
-    return laneId % 2 === 1 ? -1 : 1;
-  };
-
   // 分枝层级：主干 0，直接分出的 1，二级枝 2……（越深越短、越向上，避免树冠横向无限扩张）
   const laneById = new Map(lanes.map((l) => [l.id, l]));
   const depthOf = (laneId: number): number => {
@@ -141,139 +126,229 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     return depth;
   };
 
-  lanes.forEach((lane) => {
-    const laneCommits = laneCommitsOf(lane);
-    if (laneCommits.length === 0) return;
+  // ==================== 1) 主干骨架 ====================
+  // 主干用参数曲线生成：高度单调上升，横向按正弦缓慢摆动。
+  // 随机游走式的偏摆会互相抵消，把主干画成一根笔直的杆；参数曲线则有真实树干的姿态，
+  // 且相邻段严格首尾相接（p1 直接取曲线上的下一个采样点）。
+  const trunkLane = lanes.find((l) => l.id === 0) ?? lanes[0];
+  const trunkCommits = laneCommitsOf(trunkLane);
+  const trunkCount = Math.max(1, trunkCommits.length);
 
-    const isTrunk = lane.id === 0;
-    const isBranchable = isTrunk || laneCommits.length >= MIN_BRANCH_COMMITS;
-    const depth = isTrunk ? 0 : depthOf(lane.id);
+  const leanAngle = seededRandom(`${seed}:trunk-lean`, 0) * Math.PI * 2;
+  const leanAmp = 0.05 + seededRandom(`${seed}:trunk-lean`, 1) * 0.045;
+  const leanPhase = seededRandom(`${seed}:trunk-lean`, 2) * Math.PI;
+  /** 主干在高度 y 处的世界坐标（x/z 由两个正弦叠加出的缓弯决定） */
+  const trunkAt = (y: number): Vec3 => {
+    const u = clamp(y / MAX_RISE, 0, 1.4);
+    const bend = (t: number) =>
+      Math.sin(t * Math.PI * 0.85 + leanPhase) * 0.75 + Math.sin(t * Math.PI * 1.9 + leanPhase * 1.7) * 0.25;
+    // 减去 y=0 处的偏移，保证主干严格从原点起笔
+    const amp = leanAmp * MAX_RISE * (bend(u) - bend(0));
+    // `|| 0` 把 -0 归一成 0，便于测试比较
+    return [Math.cos(leanAngle) * amp || 0, y, Math.sin(leanAngle) * amp || 0];
+  };
 
+  const trunkSegLen = MAX_RISE / trunkCount;
+  const trunkPoints: Vec3[] = [trunkAt(0)];
+  const trunkRadii: number[] = [];
+  const trunkBirths: Array<[number, number]> = [];
+
+  for (let i = 0; i <= trunkCount; i++) {
+    if (i > 0) trunkPoints.push(trunkAt(i * trunkSegLen));
+  }
+
+  trunkCommits.forEach((commit, i) => {
+    const p0 = trunkPoints[i];
+    const p1 = trunkPoints[i + 1];
+    const globalIdx = commitIndex.get(commit.id) ?? i;
+    const t0 = tOf(globalIdx);
+    const t1 = globalIdx + 1 < commitCount ? tOf(globalIdx + 1) : 1;
+
+    const subtree = trunkCount - i;
+    const flare = (y: number) =>
+      1 + THICKNESS.basalFlare * Math.exp(-Math.max(0, y) / THICKNESS.flareDecay);
+    const w0 = clamp(THICKNESS.base * Math.sqrt(subtree), THICKNESS.min, THICKNESS.max) * flare(p0[1]);
+    const w1 = clamp(THICKNESS.base * Math.sqrt(Math.max(1, subtree - 1)), THICKNESS.min, THICKNESS.max) * flare(p1[1]);
+
+    const birth: [number, number] = [t0, Math.min(1, Math.max(t1, t0 + 1e-6))];
+    segments.push({
+      id: `seg-${trunkLane.id}-${i}`,
+      commitId: commit.id,
+      laneId: trunkLane.id,
+      kind: "trunk",
+      p0: [...p0] as Vec3,
+      p1: [...p1] as Vec3,
+      w0,
+      w1,
+      birth,
+    });
+    if (trunkRadii.length === 0) trunkRadii.push(w0);
+    trunkRadii.push(w1);
+    trunkBirths.push(birth);
+    tips.set(commit.id, [...p1] as Vec3);
+  });
+
+  if (trunkBirths.length > 0) {
+    branches.push({
+      laneId: trunkLane.id,
+      kind: "trunk",
+      points: trunkPoints,
+      radii: trunkRadii,
+      births: trunkBirths,
+    });
+  }
+
+  // ==================== 2) 枝条 ====================
+  // 每条非主干 lane 是一根从主干（或父枝）伸出的连续弧线：
+  // 起点取在主干上部（按 fork 时间换算高度），方向由仰角+黄金角方位角决定，
+  // 沿二次贝塞尔弧生长，末端上拱——避免出现「笔直的针」和「贴干的芦苇」。
+  const limbLanes = lanes
+    .filter((lane) => lane !== trunkLane)
+    .map((lane) => ({ lane, depth: depthOf(lane.id), laneCommits: laneCommitsOf(lane) }))
+    .filter((it) => it.laneCommits.length > 0)
+    // 父枝先建，子枝才能挂到父枝的梢部
+    .sort((a, b) => a.depth - b.depth || a.lane.id - b.lane.id);
+
+  /** 树冠包络半径：枝条末端不得超出，否则冠幅会失控 */
+  const crownRadius = MAX_RISE * 0.58;
+
+  // 一级枝在主干上的挂点高度：按 fork 时间排位次后均匀铺满树冠区。
+  // 直接用 forkT 会挤在低处（多数分支都在早期分叉），留出一大截秃顶的主干。
+  const primaryLanes = limbLanes
+    .filter((it) => it.depth <= 1)
+    .map((it) => ({
+      laneId: it.lane.id,
+      forkT:
+        it.lane.forkCommitId && commitIndex.get(it.lane.forkCommitId) !== undefined
+          ? tOf(commitIndex.get(it.lane.forkCommitId)!)
+          : 0.5,
+    }))
+    .sort((a, b) => a.forkT - b.forkT);
+  const attachYOf = new Map<number, number>();
+  const CROWN_BASE = 0.3;
+  const CROWN_TOP = 0.93;
+  primaryLanes.forEach((item, rank) => {
+    const u = primaryLanes.length <= 1 ? 0.5 : rank / (primaryLanes.length - 1);
+    attachYOf.set(item.laneId, MAX_RISE * (CROWN_BASE + (CROWN_TOP - CROWN_BASE) * u));
+  });
+
+  /** 一级枝的弧线：主干上的提交没有枝条可挂叶，就把叶簇挂到最近的这根枝上 */
+  const limbArcs: Array<{ attachY: number; at: (u: number) => Vec3 }> = [];
+
+  for (const { lane, depth, laneCommits } of limbLanes) {
     // 起点
-    let p: Vec3 = [0, 0, 0];
-    if (!isTrunk && lane.forkCommitId) {
-      const forkTip = tips.get(lane.forkCommitId);
-      if (forkTip) p = [...forkTip] as Vec3;
+    let p: Vec3;
+    if (depth <= 1) {
+      p = trunkAt(attachYOf.get(lane.id) ?? MAX_RISE * 0.6);
+    } else {
+      const parentTip = lane.forkCommitId ? tips.get(lane.forkCommitId) : undefined;
+      p = parentTip ? ([...parentTip] as Vec3) : trunkAt(MAX_RISE * 0.7);
     }
 
-    const segLen = isTrunk
-      ? clamp(MAX_RISE / laneCommits.length, TRUNK_SEG_LEN.min, TRUNK_SEG_LEN.max)
-      : clamp(
-          MAX_RISE * 0.75 * Math.pow(BRANCH_DEPTH_SHRINK, depth) / laneCommits.length,
-          BRANCH_SEG_LEN.min,
-          BRANCH_SEG_LEN.max
-        );
-    // 分支很短的 lane（合并产生的大量 1–3 提交小枝）默认只有几单位长，肉眼看等于不存在；
-    // 给一个随层级衰减的最小伸展长度，小枝也长成可见的细枝，树冠才有层次。
-    const minBranchLen = MIN_BRANCH_EXTENT * Math.pow(BRANCH_DEPTH_SHRINK, depth);
-    const branchSegLen = isTrunk
-      ? segLen
-      : Math.max(segLen, minBranchLen / Math.max(1, laneCommits.length));
+    const r0 = seededRandom(`${seed}:lane:${lane.id}`, 0);
+    const heightRatio = clamp(p[1] / MAX_RISE, 0, 1);
+    // 顶端优势：越高处的枝越竖直；层级越深越平展
+    const elevDeg = clamp(
+      58 - heightRatio * 26 - depth * BRANCH_DEPTH_FLATTEN_DEG + (r0 * 2 - 1) * 10,
+      12,
+      66
+    );
+    const elevation = (elevDeg * Math.PI) / 180;
+    const azimuth =
+      lane.id * GOLDEN_ANGLE + (seededRandom(`${seed}:lane-az:${lane.id}`, 1) * 2 - 1) * 0.6;
+    const dir = vNorm([
+      Math.cos(azimuth) * Math.cos(elevation),
+      Math.sin(elevation),
+      Math.sin(azimuth) * Math.cos(elevation),
+    ]);
 
-    // 初始方向：主干竖直向上；支线由仰角 + 方位角确定
-    let dir: Vec3 = [0, 1, 0];
-    /** 本枝的目标仰角（弧度）：后续每段都向它回归 */
-    let baseElevation = Math.PI / 2;
-    if (!isTrunk) {
-      const side = sideOf(lane.forkCommitId, lane.id);
-      const r = seededRandom(`${seed}:lane:${lane.id}`, 0);
-      const magDeg =
-        BRANCH_ANGLE_RANGE.minDeg +
-        r * (BRANCH_ANGLE_RANGE.maxDeg - BRANCH_ANGLE_RANGE.minDeg) +
-        depth * BRANCH_DEPTH_RISE_DEG; // 二级以上枝条更向上收，避免树冠摊平
-      const elevation = (Math.min(magDeg, 78) * Math.PI) / 180;
-      baseElevation = elevation;
-      // 方位角：侧向 ±90° 为基础，加种子扰动，使支线绕主干散开
-      const azimuth = (side * Math.PI) / 2 + (seededRandom(`${seed}:lane-az:${lane.id}`, 1) * 2 - 1) * 0.9;
-      dir = vNorm([
-        Math.cos(azimuth) * Math.cos(elevation),
-        Math.sin(elevation),
-        Math.sin(azimuth) * Math.cos(elevation),
-      ]);
+    // 长度：提交越多越长，短枝也有可见长度；再叠一层种子扰动，避免所有枝一样长（像铁丝笼）
+    const lenFactor = Math.min(1, laneCommits.length / 14);
+    const length =
+      MAX_RISE *
+      LIMB_LEN_RATIO *
+      Math.pow(BRANCH_DEPTH_SHRINK, depth) *
+      (0.5 + 0.75 * lenFactor) *
+      (0.72 + seededRandom(`${seed}:lane-len:${lane.id}`, 4) * 0.62);
+
+    let tip = vAdd(p, vScale(dir, length));
+    const radial = Math.hypot(tip[0], tip[2]);
+    if (radial > crownRadius) {
+      const k = crownRadius / radial;
+      tip = [tip[0] * k, tip[1], tip[2] * k];
     }
 
-    // 连续管的控制点（首点为 lane 起点，后续每段追加终点）
-    const branchPoints: Vec3[] = [[...p] as Vec3];
+    // 二次贝塞尔：中点向外上拱，得到自然的枝条弧线
+    const ctrl: Vec3 = [
+      (p[0] + tip[0]) / 2 + dir[0] * length * 0.1,
+      (p[1] + tip[1]) / 2 + length * 0.16,
+      (p[2] + tip[2]) / 2 + dir[2] * length * 0.1,
+    ];
+    const at = (u: number): Vec3 => {
+      const m = 1 - u;
+      return [
+        m * m * p[0] + 2 * m * u * ctrl[0] + u * u * tip[0],
+        m * m * p[1] + 2 * m * u * ctrl[1] + u * u * tip[1],
+        m * m * p[2] + 2 * m * u * ctrl[2] + u * u * tip[2],
+      ];
+    };
+    if (depth <= 1) limbArcs.push({ attachY: p[1], at });
+
+    const n = laneCommits.length;
+    const branchPoints: Vec3[] = [at(0)];
     const branchRadii: number[] = [];
     const branchBirths: Array<[number, number]> = [];
+    /** 枝条比主干细：同一「子树提交数」下约为主干的 0.62 倍 */
+    const limbThicknessScale = 0.62;
 
     laneCommits.forEach((commit, i) => {
-      // 确定性偏摆：在垂直于当前方向的平面上扰动（FR-TL：主干 ±7°）
-      const swayR = seededRandom(`${seed}:${commit.id}`, 0);
-      const swayDeg = (swayR * 2 - 1) * (isTrunk ? TRUNK_SWAY_DEG : BRANCH_SWAY_DEG);
-      dir = perturb(dir, swayDeg, seededRandom(`${seed}:${commit.id}`, 1) * Math.PI * 2);
-      if (isTrunk) {
-        // 主干保持向上生长趋势：轻度收敛水平分量（过强会把 ±7° 偏摆压成直线）
-        dir = vNorm([dir[0] * 0.85, Math.max(dir[1], 0.55), dir[2] * 0.85]);
-      } else {
-        // 支线：向本枝的初始仰角缓慢回归。
-        // 不能用「每段 +0.06 向上抬」——那是累加的，几十段后仰角会从 40° 爬到 80°，
-        // 枝条被拉成竖直的芦苇，失去树的形态。
-        const curElev = Math.asin(Math.max(-1, Math.min(1, dir[1])));
-        // 枝条越往外越向上拱（真实枝条末端朝上翘）
-        const arch = (i / Math.max(1, laneCommits.length - 1)) * ((BRANCH_TIP_ARCH_DEG * Math.PI) / 180);
-        const wanted = Math.min(baseElevation + arch, Math.PI / 2 - 0.05);
-        const elev = curElev + (wanted - curElev) * 0.08;
-        const hor = Math.hypot(dir[0], dir[2]);
-        if (hor > 1e-4) {
-          const cosE = Math.cos(elev);
-          dir = vNorm([(dir[0] / hor) * cosE, Math.sin(elev), (dir[2] / hor) * cosE]);
-        }
-      }
-
-      const p0 = p;
-      const p1 = vAdd(p0, vScale(dir, branchSegLen));
-
+      const p0 = at(i / n);
+      const p1 = at((i + 1) / n);
       const globalIdx = commitIndex.get(commit.id) ?? i;
       const t0 = tOf(globalIdx);
       const t1 = globalIdx + 1 < commitCount ? tOf(globalIdx + 1) : 1;
 
-      // 管道粗细（FR-TL-06）
-      const subtree = laneCommits.length - i;
-      let w0 = clamp(THICKNESS.base * Math.sqrt(subtree), THICKNESS.min, THICKNESS.max);
-      let w1 = clamp(THICKNESS.base * Math.sqrt(Math.max(1, subtree - 1)), THICKNESS.min, THICKNESS.max);
+      const subtree = n - i;
+      // 枝条粗细：短枝也要有肉眼可见的径（最小 2.4 单位），否则树冠只剩一堆细线
+      const w0 = clamp(THICKNESS.base * limbThicknessScale * Math.sqrt(subtree), 3, 15);
+      const w1 = clamp(
+        THICKNESS.base * limbThicknessScale * Math.sqrt(Math.max(1, subtree - 1)),
+        3,
+        15
+      );
+      const birth: [number, number] = [t0, Math.min(1, Math.max(t1, t0 + 1e-6))];
 
-      // 根颈膨大：主干底部指数衰减的加粗，有明显「扎进土里」的板根感
-      if (isTrunk) {
-        const flare = (y: number) => 1 + THICKNESS.basalFlare * Math.exp(-Math.max(0, y) / THICKNESS.flareDecay);
-        w0 *= flare(p0[1]);
-        w1 *= flare(p1[1]);
-      }
-
-      if (isBranchable) {
-        segments.push({
-          id: `seg-${lane.id}-${i}`,
-          commitId: commit.id,
-          laneId: lane.id,
-          kind: isTrunk ? "trunk" : "branch",
-          p0,
-          p1,
-          w0,
-          w1,
-          birth: [t0, Math.min(1, Math.max(t1, t0 + 1e-6))],
-        });
-        // 锥度连续：上一段的 w1 恰为下一段的 w0
-        if (branchRadii.length === 0) branchRadii.push(w0);
-        branchRadii.push(w1);
-        branchPoints.push(p1);
-        branchBirths.push([t0, Math.min(1, Math.max(t1, t0 + 1e-6))]);
-      }
+      segments.push({
+        id: `seg-${lane.id}-${i}`,
+        commitId: commit.id,
+        laneId: lane.id,
+        kind: "branch",
+        p0,
+        p1,
+        w0,
+        w1,
+        birth,
+      });
+      if (branchRadii.length === 0) branchRadii.push(w0);
+      branchRadii.push(w1);
+      branchPoints.push(p1);
+      branchBirths.push(birth);
       tips.set(commit.id, p1);
-      p = [...p1] as Vec3;
     });
 
     if (branchBirths.length > 0) {
       branches.push({
         laneId: lane.id,
-        kind: isTrunk ? "trunk" : "branch",
+        kind: "branch",
         points: branchPoints,
         radii: branchRadii,
         births: branchBirths,
       });
     }
-  });
+  }
 
   // 叶子：每个非 merge 提交（FR-TL-07）
+  const trunkCommitIds = new Set(trunkCommits.map((c) => c.id));
   const authorColorByName = new Map(model.authors.map((a) => [a.name, a.colorIndex]));
   const dormancyThreshold =
     commitCount >= 2
@@ -291,17 +366,24 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     const t0 = tOf(idx);
     const t1 = idx + 1 < commitCount ? tOf(idx + 1) : 1;
 
-    // 叶尖偏移：以段梢为球心、向上半球随机散开
-    const offR = seededRandom(`${seed}:${commit.id}`, 1);
-    const offPhi = seededRandom(`${seed}:${commit.id}`, 2) * Math.PI * 2;
-    const offTheta = 0.35 + seededRandom(`${seed}:${commit.id}`, 5) * 0.9; // 仰角
-    const offDist = 8 + offR * 14;
-    const offset: Vec3 = [
-      Math.cos(offPhi) * Math.cos(offTheta) * offDist,
-      Math.sin(offTheta) * offDist,
-      Math.sin(offPhi) * Math.cos(offTheta) * offDist,
-    ];
-    const pos = vAdd(tip, offset);
+    // 叶簇中心
+    const radial = Math.hypot(tip[0], tip[2]);
+    const outX = radial > 1e-3 ? tip[0] / radial : Math.cos(idx * GOLDEN_ANGLE);
+    const outZ = radial > 1e-3 ? tip[2] / radial : Math.sin(idx * GOLDEN_ANGLE);
+    let center: Vec3;
+    if (trunkCommitIds.has(commit.id) && limbArcs.length > 0) {
+      // 主干上没有枝条，叶簇挂到高度最接近的那根枝条上——叶子绝不能悬在半空
+      let best = limbArcs[0];
+      for (const arc of limbArcs) {
+        if (Math.abs(arc.attachY - tip[1]) < Math.abs(best.attachY - tip[1])) best = arc;
+      }
+      const u = 0.18 + seededRandom(`${seed}:${commit.id}`, 9) * 0.78;
+      const point = best.at(u);
+      center = [point[0], point[1] + 4, point[2]];
+    } else {
+      const push = 6 + seededRandom(`${seed}:${commit.id}`, 1) * 12;
+      center = [tip[0] + outX * push, tip[1] + 4, tip[2] + outZ * push];
+    }
 
     const typeColor = commit.type === "spec" || commit.type === "hook";
     const colorIndex = typeColor
@@ -318,22 +400,41 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
       }
     }
 
-    leaves.push({
-      id: `leaf-${idx}`,
-      commitId: commit.id,
-      pos,
-      size: leafSizeOf(commit),
-      shape: leafShapeOf(commit),
-      colorIndex,
-      birth: t1,
-      fallAt,
-      phase: (pos[0] + pos[1] + pos[2]) * 0.01,
-      axis: vNorm([
-        seededRandom(`${seed}:${commit.id}`, 6) * 2 - 1,
-        seededRandom(`${seed}:${commit.id}`, 7) * 2 - 1,
-        seededRandom(`${seed}:${commit.id}`, 8) * 2 - 1,
-      ]),
-    });
+    // 一簇叶子：k=0 为主叶（信息面板定位锚点），其余散布成叶团
+    for (let k = 0; k < LEAVES_PER_CLUSTER; k++) {
+      const r1 = seededRandom(`${seed}:${commit.id}:${k}`, 11);
+      const r2 = seededRandom(`${seed}:${commit.id}:${k}`, 12);
+      const r3 = seededRandom(`${seed}:${commit.id}:${k}`, 13);
+      const r4 = seededRandom(`${seed}:${commit.id}:${k}`, 14);
+      const dist = 3 + r1 * 9;
+      const theta = Math.acos(1 - r2 * 0.85); // 偏向上半球
+      const phi = k * GOLDEN_ANGLE + r3 * Math.PI;
+      const pos: Vec3 =
+        k === 0
+          ? center
+          : [
+              center[0] + Math.cos(phi) * Math.sin(theta) * dist,
+              center[1] + Math.cos(theta) * dist * 0.85,
+              center[2] + Math.sin(phi) * Math.sin(theta) * dist,
+            ];
+
+      leaves.push({
+        id: k === 0 ? `leaf-${idx}` : `leaf-${idx}-${k}`,
+        commitId: commit.id,
+        pos,
+        size: leafSizeOf(commit) * (k === 0 ? 1 : 0.72 + r4 * 0.42),
+        shape: leafShapeOf(commit),
+        colorIndex,
+        birth: t1,
+        fallAt,
+        phase: (pos[0] + pos[1] + pos[2]) * 0.01,
+        axis: vNorm([
+          seededRandom(`${seed}:${commit.id}:${k}`, 6) * 2 - 1,
+          seededRandom(`${seed}:${commit.id}:${k}`, 7) * 2 - 1,
+          seededRandom(`${seed}:${commit.id}:${k}`, 8) * 2 - 1,
+        ]),
+      });
+    }
   });
 
   // 果实：标签（FR-TL-07 的三维版）

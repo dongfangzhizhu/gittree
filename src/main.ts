@@ -7,9 +7,9 @@ import { GitHubSource } from "./core/github-source";
 import { normalizeCommits, associateTags } from "./core/normalize";
 import { sampleCommits, reconnectParents } from "./core/sampler";
 import { buildGrowthModel } from "./core/growth-model";
-import { buildScene } from "./three/scene-builder";
+import { buildForestScene, ForestInput, ForestScene, ForestTreeMeta } from "./three/forest-builder";
 import { TreeRenderer, ViewName } from "./three/three-renderer";
-import { parseGitHubInput } from "./core/input-parser";
+import { parseGitHubInput, parseGitHubList } from "./core/input-parser";
 import { AppError, ErrorMessages } from "./core/errors";
 import { PRESETS } from "./presets";
 import { createTokenUI } from "./ui/token-ui";
@@ -28,7 +28,12 @@ import { Commit, GrowthModel, RawHistory } from "./core/types";
 
 interface AppState {
   isLoading: boolean;
+  /** 焦点树的模型（HUD / 导出用它；森林里点哪棵树就切到哪棵） */
   model: GrowthModel | null;
+  /** 当前森林：每棵树一个条目 */
+  forest: ForestEntry[];
+  /** 焦点树索引 */
+  focusIndex: number;
   isPlaying: boolean;
   currentTime: number;
   duration: number;
@@ -39,12 +44,21 @@ interface AppState {
   cacheSavedAt: number | null;
 }
 
+/** 森林里的一棵树 */
+interface ForestEntry {
+  model: GrowthModel;
+  label: string;
+  repo: string;
+}
+
 // 加载控制
 let loadAbortController: AbortController | null = null;
 
 const state: AppState = {
   isLoading: false,
   model: null,
+  forest: [],
+  focusIndex: 0,
   isPlaying: false,
   currentTime: 0,
   duration: 30,
@@ -100,6 +114,8 @@ function ensureRenderer(): TreeRenderer | null {
   if (renderer) return renderer;
   try {
     renderer = new TreeRenderer(canvas);
+    // 每次绘制后把 HTML 名牌摆到对应树的树冠上（相机旋转/缩放时跟随）
+    renderer.onAfterRender = updateTreeLabels;
   } catch (error: any) {
     showError(`无法初始化三维渲染器（WebGL）：${error?.message || "当前浏览器可能不支持 WebGL"}`);
     return null;
@@ -112,92 +128,113 @@ function ensureRenderer(): TreeRenderer | null {
 /**
  * 加载仓库（勾选缓存时优先命中本地缓存）
  */
-async function loadRepository() {
-  const input = repoInput.value.trim();
-  if (!input) {
-    showError("请输入 GitHub 仓库地址");
-    return;
+/** 加载项：预置 / 内置快照 / 真实仓库 */
+type LoadItem =
+  | { kind: "preset"; index: number }
+  | { kind: "snapshot"; entry: SnapshotEntry }
+  | { kind: "repo"; repo: string };
+
+/** 规范化 → 采样 → 生长模型 */
+function modelFromRaw(raw: RawHistory, owner: string, repo: string): GrowthModel {
+  const normalized = normalizeCommits(raw);
+  if (normalized.length === 0) {
+    throw new AppError("EMPTY_REPO", ErrorMessages.EMPTY_REPO.message, 404);
+  }
+  const tagMap = associateTags(normalized, raw.tags || []);
+  const { commits: sampled, samplingRate } = sampleCommits(normalized, new Set(tagMap.keys()));
+  const reconnected = reconnectParents(sampled, normalized);
+  const model = buildGrowthModel(reconnected, raw.tags || [], samplingRate);
+  model.source = { kind: "github", owner, repo };
+  return model;
+}
+
+/** 拉取单个仓库（勾选缓存时优先命中本地缓存） */
+async function loadRepo(
+  rawRepo: string
+): Promise<{ model: GrowthModel; fromCache: boolean; savedAt: number | null }> {
+  const { owner, repo } = parseGitHubInput(rawRepo);
+  const repoFull = `${owner}/${repo}`;
+  const cacheEnabled = isCacheEnabled();
+  let raw: RawHistory | null = null;
+  let fromCache = false;
+  let savedAt: number | null = null;
+
+  if (cacheEnabled) {
+    const cached = loadCached(repoFull);
+    if (cached) {
+      raw = cached.raw;
+      fromCache = true;
+      savedAt = cached.savedAt;
+      showStatus(`命中 ${repoFull} 的本地缓存（${formatCacheAge(cached.savedAt)}）`);
+    }
   }
 
-  try {
-    state.isLoading = true;
-    loadBtn.disabled = true;
-    if (cancelBtn) cancelBtn.style.display = "";
-    clearError();
-
-    const { owner, repo } = parseGitHubInput(input);
-    const repoFull = `${owner}/${repo}`;
-    currentRepoFull = repoFull;
-
-    const cacheEnabled = isCacheEnabled();
-    let raw: RawHistory | null = null;
-    let fromCache = false;
-    let cacheSavedAt: number | null = null;
-
-    // 1. 命中缓存则跳过拉取
+  if (!raw) {
+    showStatus(`正在请求 ${repoFull} ...`);
+    const source = new GitHubSource();
+    loadAbortController = new AbortController();
+    raw = await source.load(repoFull, { token: tokenUI.getToken() }, loadAbortController.signal);
     if (cacheEnabled) {
-      const cached = loadCached(repoFull);
-      if (cached) {
-        raw = cached.raw;
-        fromCache = true;
-        cacheSavedAt = cached.savedAt;
-        showStatus(`命中本地缓存（${formatCacheAge(cached.savedAt)}），跳过拉取`);
+      const result = saveCached(repoFull, raw);
+      if (result.ok) {
+        savedAt = Date.now();
+      } else {
+        showStatus(`数据已加载，但缓存写入失败：${result.error}`);
+      }
+    }
+  }
+
+  return { model: modelFromRaw(raw, owner, repo), fromCache, savedAt };
+}
+
+/**
+ * 统一加载入口：1..N 个项目 → 森林
+ * 单个项目就是「一棵树的森林」，与多项目共享同一条渲染/交互路径。
+ */
+async function loadItems(items: LoadItem[]) {
+  if (items.length === 0) return;
+  state.isLoading = true;
+  loadBtn.disabled = true;
+  syncSelectionBar();
+  if (cancelBtn) cancelBtn.style.display = "";
+  clearError();
+
+  try {
+    const entries: ForestEntry[] = [];
+    let anyCache = false;
+    let lastSaved: number | null = null;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (items.length > 1) showStatus(`正在加载第 ${i + 1}/${items.length} 个项目...`);
+
+      if (item.kind === "preset") {
+        const preset = PRESETS[item.index];
+        entries.push({ model: preset.load(), label: preset.name, repo: "" });
+      } else if (item.kind === "snapshot") {
+        const entry = item.entry;
+        const res = await fetch(`snapshots/${entry.file}`);
+        if (!res.ok) throw new Error(`快照读取失败（HTTP ${res.status}）`);
+        const data = await res.json();
+        const raw = data.raw as RawHistory;
+        if (!raw || !Array.isArray(raw.commits)) throw new Error("快照结构异常：缺少提交数据");
+        const [owner, repo] = entry.repo.split("/");
+        entries.push({ model: modelFromRaw(raw, owner, repo), label: entry.label, repo: entry.repo });
+        anyCache = true; // 快照等同「本地已有数据」
+        lastSaved = data.fetchedAt ?? null;
+      } else {
+        const r = await loadRepo(item.repo);
+        if (r.fromCache) anyCache = true;
+        if (r.savedAt) lastSaved = r.savedAt;
+        const [owner, repo] = item.repo.split("/");
+        entries.push({ model: r.model, label: repo || item.repo, repo: `${owner}/${repo}` });
       }
     }
 
-    // 2. 未命中则请求 GitHub
-    if (!raw) {
-      showStatus("正在加载...");
-      const source = new GitHubSource();
-      loadAbortController = new AbortController();
-      raw = await source.load(repoFull, { token: tokenUI.getToken() }, loadAbortController.signal);
-
-      // 3. 勾选了缓存则写入
-      if (cacheEnabled) {
-        const result = saveCached(repoFull, raw);
-        if (result.ok) {
-          cacheSavedAt = Date.now();
-        } else {
-          // 缓存写入失败不阻塞主流程，但明确告知（不静默降级）
-          showStatus(`数据已加载，但缓存写入失败：${result.error}`);
-        }
-      }
-    }
-
-    showStatus("正在处理数据...");
-
-    // 规范化提交
-    const normalized = normalizeCommits(raw);
-    if (normalized.length === 0) {
-      throw new AppError("EMPTY_REPO", ErrorMessages.EMPTY_REPO.message, 404);
-    }
-    const tagMap = associateTags(normalized, raw.tags);
-    const taggedIds = new Set(Array.from(tagMap.keys()));
-
-    // 采样
-    const { commits: sampled, samplingRate } = sampleCommits(normalized, taggedIds);
-
-    // 父节点重连
-    const reconnected = reconnectParents(sampled, normalized);
-
-    // 构建生长模型与三维场景
-    const model = buildGrowthModel(reconnected, raw.tags, samplingRate);
-    model.source = { kind: "github", owner, repo };
-
-    state.fromCache = fromCache;
-    state.cacheSavedAt = cacheSavedAt;
-
-    // 更新 URL 以便分享
-    if (!window.location.search.includes(repoFull)) {
-      window.history.replaceState({}, "", `?repo=${encodeURIComponent(repoFull)}`);
-    }
-
-    const cacheNote = fromCache && cacheSavedAt
-      ? ` · 来自缓存（${formatCacheAge(cacheSavedAt)}）`
-      : "";
-    const ok = showModel(model, repoFull, `已加载 ${model.commits.length} 个提交（${Math.floor(samplingRate * 100)}% 采样）${cacheNote}`);
-    if (!ok) return;
-    refreshCacheStatus(repoFull);
+    state.fromCache = anyCache;
+    state.cacheSavedAt = lastSaved;
+    showForest(entries);
+    updateUrl(entries);
   } catch (error: any) {
     showError(formatErrorForUI(error));
   } finally {
@@ -205,102 +242,162 @@ async function loadRepository() {
     if (cancelBtn) cancelBtn.style.display = "none";
     state.isLoading = false;
     loadBtn.disabled = false;
+    syncSelectionBar();
   }
 }
 
-/**
- * 公共收尾：模型 → 三维场景 → 重置进度 → 自动播放
- */
-function showModel(model: GrowthModel, seed: string, statusText: string): boolean {
+/** 输入框 → 加载（支持一次输入多个仓库，生成森林） */
+async function loadRepository() {
+  const input = repoInput.value.trim();
+  if (!input) {
+    showError("请输入 GitHub 仓库地址");
+    return;
+  }
+  const { repos, invalid } = parseGitHubList(input);
+  if (repos.length === 0) {
+    showError(invalid.length ? `无法解析：${invalid.slice(0, 3).join("、")}` : "请输入 GitHub 仓库地址");
+    return;
+  }
+  if (invalid.length > 0) {
+    showStatus(`已忽略无法解析的输入：${invalid.slice(0, 3).join("、")}`);
+  }
+  await loadItems(repos.map((repo) => ({ kind: "repo" as const, repo })));
+}
+
+/** 公共收尾：多棵树 → 森林场景 → 重置进度 → 自动播放 */
+function showForest(entries: ForestEntry[]): boolean {
   const r = ensureRenderer();
-  if (!r) return false;
+  if (!r || entries.length === 0) return false;
 
-  const scene = buildScene(model, { seed: seed || `${model.source.owner}/${model.source.repo}` });
-  state.model = model;
+  const inputs: ForestInput[] = entries.map((e) => ({
+    model: e.model,
+    label: e.label,
+    repo: e.repo,
+  }));
+  const scene: ForestScene = buildForestScene(inputs);
+
+  state.forest = entries;
+  state.focusIndex = 0;
+  state.model = entries[0].model;
+  currentRepoFull = entries.length === 1 ? entries[0].repo : "";
+  repoInput.value = entries
+    .map((e) => e.repo)
+    .filter(Boolean)
+    .join(", ");
+
   r.setScene(scene);
-
-  // 重置播放进度：新树从 t=0 开始生长
   pausePlayback();
   state.currentTime = 0;
   infoPanel.show(null);
+  mountTreeLabels(scene.trees);
+  syncFocusLabels();
 
+  const totalCommits = entries.reduce((n, e) => n + e.model.commits.length, 0);
+  const statusText =
+    entries.length === 1
+      ? `已加载 ${entries[0].model.commits.length} 个提交 · ${entries[0].label}`
+      : `已生成 ${entries.length} 棵树的森林 · 共 ${totalCommits} 个提交`;
   showStatus(statusText);
   showCanvas();
   startPlayback();
   render();
+  refreshCacheStatus(currentRepoFull);
   return true;
 }
 
-/**
- * 加载内置快照（仓库真实数据，抓取后随应用分发，不消耗 API 限额）
- */
-async function loadSnapshot(entry: SnapshotEntry) {
-  try {
-    state.isLoading = true;
-    clearError();
-    showStatus(`正在加载内置快照：${entry.label}...`);
-
-    const res = await fetch(`snapshots/${entry.file}`);
-    if (!res.ok) throw new Error(`快照读取失败（HTTP ${res.status}）`);
-    const data = await res.json();
-    const raw = data.raw as RawHistory;
-    if (!raw || !Array.isArray(raw.commits)) throw new Error("快照结构异常：缺少提交数据");
-
-    const normalized = normalizeCommits(raw);
-    if (normalized.length === 0) {
-      throw new AppError("EMPTY_REPO", ErrorMessages.EMPTY_REPO.message, 404);
-    }
-    const tagMap = associateTags(normalized, raw.tags || []);
-    const taggedIds = new Set(Array.from(tagMap.keys()));
-    const { commits: sampled, samplingRate } = sampleCommits(normalized, taggedIds);
-    const reconnected = reconnectParents(sampled, normalized);
-
-    const model = buildGrowthModel(reconnected, raw.tags || [], samplingRate);
-    const [owner, repo] = entry.repo.split("/");
-    model.source = { kind: "github", owner, repo };
-
-    state.fromCache = true; // 快照等同「本地已有数据」
-    state.cacheSavedAt = data.fetchedAt ?? null;
-    currentRepoFull = entry.repo;
-    repoInput.value = entry.repo;
-
-    const tagNote = entry.tags ? ` · ${entry.tags} 个标签` : "";
-    const fetchedAt = data.fetchedAt ? new Date(data.fetchedAt).toLocaleDateString("zh-CN") : "—";
-    showModel(
-      model,
-      entry.repo,
-      `${entry.label} 内置快照 · ${model.commits.length} 个提交${tagNote} · 抓取于 ${fetchedAt}`
-    );
-    refreshCacheStatus(entry.repo);
-  } catch (error: any) {
-    showError(formatErrorForUI(error));
-  } finally {
-    state.isLoading = false;
-  }
+/** 单项目便捷入口（卡片双击） */
+function loadSingle(item: LoadItem) {
+  void loadItems([item]);
 }
 
 /**
- * 加载预置（演示数据，纯本地构造）
+ * 切换焦点树：HUD / 导出 / 信息面板都以焦点树的模型为准
+ * 点击某棵树上的叶子或果实、或点击名牌都会调用
  */
-async function loadPreset(index: number) {
-  try {
-    state.isLoading = true;
-    showStatus("正在加载预置作品...");
-    clearError();
+function setFocusTree(index: number) {
+  const entry = state.forest[index];
+  if (!entry) return;
+  const changed = state.focusIndex !== index;
+  state.focusIndex = index;
+  state.model = entry.model;
+  currentRepoFull = entry.repo;
+  syncFocusLabels();
+  if (!changed) return;
+  render();
+  refreshCacheStatus(currentRepoFull);
+  showStatus(
+    state.forest.length > 1
+      ? `焦点切换到「${entry.label}」· ${entry.model.commits.length} 个提交`
+      : `已加载 ${entry.model.commits.length} 个提交 · ${entry.label}`
+  );
+}
 
-    const preset = PRESETS[index];
-    const model = preset.load();
+/** 名牌高亮：焦点树加 .focused */
+function syncFocusLabels() {
+  treeLabelEls.forEach((el, i) => el.classList.toggle("focused", i === state.focusIndex));
+}
 
-    state.fromCache = false;
-    state.cacheSavedAt = null;
-    currentRepoFull = "";
+/** 更新分享链接：多仓库用 ?repos=a/b,c/d */
+function updateUrl(entries: ForestEntry[]) {
+  const repos = entries.map((e) => e.repo).filter(Boolean);
+  if (repos.length === 0) return;
+  const next =
+    repos.length === 1
+      ? `?repo=${encodeURIComponent(repos[0])}`
+      : `?repos=${repos.map(encodeURIComponent).join(",")}`;
+  if (window.location.search !== next) {
+    window.history.replaceState({}, "", next);
+  }
+}
 
-    showModel(model, "", `已加载 ${model.commits.length} 个提交（演示数据）`);
-    refreshCacheStatus("");
-  } catch (error: any) {
-    showError(formatErrorForUI(error));
-  } finally {
-    state.isLoading = false;
+// ==================== 三维名牌 ====================
+
+const treeLabelsEl = document.getElementById("treeLabels") as HTMLElement | null;
+let treeLabelEls: HTMLElement[] = [];
+
+/** 为每棵树创建 HTML 名牌（跟随三维位置） */
+function mountTreeLabels(trees: ForestTreeMeta[]) {
+  if (!treeLabelsEl) return;
+  treeLabelsEl.innerHTML = "";
+  treeLabelEls = trees.map((tree) => {
+    const el = document.createElement("div");
+    el.className = "tree-label";
+    const name = document.createElement("span");
+    name.textContent = tree.label;
+    const meta = document.createElement("span");
+    meta.className = "tree-commits";
+    meta.textContent = `${tree.commits} 提交`;
+    el.append(name, meta);
+    // 点名牌也能切换焦点树
+    el.addEventListener("click", () => setFocusTree(tree.index));
+    treeLabelsEl.appendChild(el);
+    return el;
+  });
+  updateTreeLabels();
+}
+
+/** 每帧把名牌摆到对应树的树冠上方 */
+function updateTreeLabels() {
+  const r = renderer;
+  if (!r || treeLabelEls.length === 0) return;
+  const anchors = r.treeAnchors();
+  const w = canvasContainer.clientWidth || 960;
+  const h = canvasContainer.clientHeight || 540;
+  for (let i = 0; i < treeLabelEls.length; i++) {
+    const anchor = anchors[i];
+    const el = treeLabelEls[i];
+    if (!anchor || !el) continue;
+    const p = r.projectToScreen(anchor);
+    // 相机拉远/旋转后树冠可能投影到画布外，超界就隐藏
+    const outside = !p.visible || p.x < -60 || p.y < -30 || p.x > w + 60 || p.y > h + 60;
+    el.style.display = outside ? "none" : "";
+    if (!outside) {
+      // 名牌是 translate(-50%,-100%)，把锚点夹在画布内，避免贴在画布外看不见
+      const left = Math.min(Math.max(p.x, 46), w - 46);
+      const top = Math.min(Math.max(p.y, 26), h - 8);
+      el.style.left = `${left}px`;
+      el.style.top = `${top}px`;
+    }
   }
 }
 
@@ -482,14 +579,20 @@ canvas.addEventListener("pointerleave", () => {
 /** 展示节点信息面板 */
 function showNodeInfo(kind: "leaf" | "fruit", key: string) {
   const r = renderer;
-  const model = state.model;
-  if (!r || !model) return;
-
-  const commitById = new Map(model.commits.map((c) => [c.id, c]));
-  const source = model.source.kind === "github" ? model.source : null;
+  if (!r) return;
 
   const node = r.getNodeById(key);
   if (!node) return;
+
+  // 森林里每个节点都带 treeIndex：点谁就把焦点切到哪棵树
+  const treeIndex = node.item.treeIndex ?? 0;
+  if (state.forest[treeIndex]) setFocusTree(treeIndex);
+
+  const model = state.forest[treeIndex]?.model ?? state.model;
+  if (!model) return;
+
+  const commitById = new Map(model.commits.map((c) => [c.id, c]));
+  const source = model.source.kind === "github" ? model.source : null;
 
   let info: NodeInfo;
   if (node.kind === "leaf") {
@@ -903,11 +1006,100 @@ interface SnapshotEntry {
   tagsError?: string | null;
 }
 
+// ==================== 项目多选（生成森林） ====================
+
+/** 已选项目：key → 加载项 */
+const selection = new Map<string, LoadItem>();
+/** 已选卡片：key → 卡片元素（用于切换 .selected） */
+const selectionCards = new Map<string, HTMLElement>();
+/** 演示预置卡片，首页自动选中第一个用 */
+const presetCards: HTMLElement[] = [];
+
+const forestCount = document.getElementById("forestCount") as HTMLElement | null;
+const growForestBtn = document.getElementById("growForestBtn") as HTMLButtonElement | null;
+const clearSelectionBtn = document.getElementById("clearSelectionBtn") as HTMLButtonElement | null;
+const forestHint = document.getElementById("forestHint") as HTMLElement | null;
+
+/** 选中项唯一 key（大小写不敏感，避免同一仓库重复选中） */
+function itemKey(item: LoadItem): string {
+  if (item.kind === "preset") return `preset:${item.index}`;
+  if (item.kind === "snapshot") return `snapshot:${item.entry.repo.toLowerCase()}`;
+  return `repo:${item.repo.toLowerCase()}`;
+}
+
+/** 点击卡片：加入 / 移出选中集合 */
+function toggleSelect(key: string, item: LoadItem, card: HTMLElement) {
+  if (selection.has(key)) {
+    selection.delete(key);
+    selectionCards.delete(key);
+    card.classList.remove("selected");
+    card.removeAttribute("aria-selected");
+  } else {
+    selection.set(key, item);
+    selectionCards.set(key, card);
+    card.classList.add("selected");
+    card.setAttribute("aria-selected", "true");
+  }
+  syncSelectionBar();
+}
+
+/** 清空选中 */
+function clearSelection() {
+  for (const card of selectionCards.values()) {
+    card.classList.remove("selected");
+    card.removeAttribute("aria-selected");
+  }
+  selection.clear();
+  selectionCards.clear();
+  syncSelectionBar();
+}
+
+/** 选中态 / 计数 / 按钮可用性 */
+function syncSelectionBar() {
+  const n = selection.size;
+  if (forestCount) {
+    forestCount.innerHTML = `已选 <strong>${n}</strong> 个项目`;
+    forestCount.classList.toggle("is-empty", n === 0);
+  }
+  if (growForestBtn) {
+    growForestBtn.disabled = n === 0 || state.isLoading;
+    growForestBtn.textContent = n > 1 ? `🌱 生长这片森林（${n} 棵）` : "🌳 生长这棵树";
+  }
+  if (forestHint) {
+    forestHint.textContent =
+      n === 0
+        ? "点卡片可多选；也可在上方输入多个仓库（逗号或换行分隔）"
+        : n === 1
+          ? "再点其他卡片可继续多选，一次性生成森林"
+          : "选好了，点左侧按钮生成森林";
+  }
+}
+
+/** 按当前选中集合生成森林 */
+function growForest() {
+  const items = Array.from(selection.values());
+  if (items.length === 0) {
+    showError("请先选择至少一个项目");
+    return;
+  }
+  void loadItems(items);
+}
+
+if (growForestBtn) growForestBtn.addEventListener("click", growForest);
+if (clearSelectionBtn) {
+  clearSelectionBtn.addEventListener("click", () => {
+    clearSelection();
+    showStatus("已清空选中项目");
+  });
+}
+
 /**
  * 初始化预置：演示数据 + 精选真实仓库（内置快照）
+ * 卡片点击 = 切换选中（支持多选），由森林条统一触发生长
  */
 function initPresets() {
   presetsContainer.innerHTML = "";
+  presetCards.length = 0;
 
   const demoGroup = document.createElement("div");
   demoGroup.className = "preset-group";
@@ -919,10 +1111,14 @@ function initPresets() {
 
   for (let i = 0; i < PRESETS.length; i++) {
     const preset = PRESETS[i];
+    const item: LoadItem = { kind: "preset", index: i };
+    const key = itemKey(item);
     const card = document.createElement("div");
     card.className = "preset-card";
+    card.dataset.key = key;
     card.innerHTML = `<div>${preset.name}</div><strong>${preset.description}</strong>`;
-    card.addEventListener("click", () => loadPreset(i));
+    card.addEventListener("click", () => toggleSelect(key, item, card));
+    presetCards.push(card);
     demoGrid.appendChild(card);
   }
   demoGroup.append(demoTitle, demoGrid);
@@ -952,8 +1148,11 @@ async function initSnapshots() {
     grid.className = "presets-grid";
 
     for (const entry of list) {
+      const item: LoadItem = { kind: "snapshot", entry };
+      const key = itemKey(item);
       const card = document.createElement("div");
       card.className = "preset-card snapshot-card";
+      card.dataset.key = key;
       const name = document.createElement("div");
       name.textContent = entry.label;
       const desc = document.createElement("strong");
@@ -966,7 +1165,7 @@ async function initSnapshots() {
           : "无标签";
       meta.textContent = `${entry.commits ?? "?"} 提交 · ${tagNote}`;
       card.append(name, desc, meta);
-      card.addEventListener("click", () => loadSnapshot(entry));
+      card.addEventListener("click", () => toggleSelect(key, item, card));
       grid.appendChild(card);
     }
 
@@ -978,14 +1177,15 @@ async function initSnapshots() {
   }
 }
 
-// 处理 URL 参数加载仓库
+// 处理 URL 参数加载仓库（支持 ?repo=a/b 与 ?repos=a/b,c/d）
 function initFromURL() {
   const params = new URLSearchParams(window.location.search);
-  const repo = params.get("repo");
-  if (repo) {
-    repoInput.value = repo;
-    setTimeout(() => loadRepository(), 500);
-  }
+  const pack = params.get("repos") || params.get("repo");
+  if (!pack) return;
+  const { repos } = parseGitHubList(pack);
+  if (repos.length === 0) return;
+  repoInput.value = repos.join(", ");
+  setTimeout(() => loadRepository(), 500);
 }
 
 // 添加导出按钮事件
@@ -1018,6 +1218,14 @@ initFromURL();
     lastCommitTime: state.model?.commits[state.model?.commits.length - 1]?.time ?? null,
     commitTimeAt: (idx: number) => state.model?.commits[idx]?.time ?? null,
     source: state.model?.source ?? null,
+    trees: renderer?.stats().trees ?? 0,
+    focusIndex: state.focusIndex,
+    forest: state.forest.map((e) => ({
+      label: e.label,
+      repo: e.repo,
+      commits: e.model.commits.length,
+    })),
+    selection: selection.size,
     cache: {
       enabled: isCacheEnabled(),
       fromCache: state.fromCache,
@@ -1040,11 +1248,52 @@ initFromURL();
   /** 枚举叶子/果实 key（测试用） */
   sampleLeafKeys: (n?: number) => renderer?.sampleLeafKeys(n) ?? [],
   sampleFruitKeys: (n?: number) => renderer?.sampleFruitKeys(n) ?? [],
+  /** 每棵树的树冠锚点（世界坐标） */
+  treeAnchors: () => renderer?.treeAnchors() ?? [],
+  /** 每棵树的树冠锚点 → 页面坐标（测试名牌位置） */
+  treeLabelPos: () =>
+    treeLabelEls.map((el) => ({
+      text: el.textContent ?? "",
+      display: el.style.display,
+      left: el.style.left,
+      top: el.style.top,
+      focused: el.classList.contains("focused"),
+    })),
+  /** 当前选中集合（测试多选） */
+  selectionKeys: () => Array.from(selection.keys()),
+  /** 点击第 i 张卡片（preset 或 snapshot 索引） */
+  clickCard: (index: number, scope: "preset" | "snapshot" = "preset") => {
+    const el =
+      scope === "preset"
+        ? presetCards[index]
+        : presetsContainer.querySelectorAll<HTMLElement>(".snapshot-card")[index];
+    el?.click();
+    return !!el;
+  },
+  /** 切换焦点树 */
+  selectTree: (index: number) => {
+    setFocusTree(index);
+    return state.focusIndex;
+  },
+  /** 直接按预置索引生成单棵树 */
+  loadPreset: (index: number) => {
+    if (!PRESETS[index]) return false;
+    loadSingle({ kind: "preset", index });
+    return true;
+  },
+  /** 按「owner/repo」列表生成森林（内置快照优先，否则走 API） */
+  growRepos: (repos: string[]) => {
+    void loadItems(repos.map((repo) => ({ kind: "repo" as const, repo })));
+    return repos.length;
+  },
 };
 
-// 首页自动加载第一个预置
+// 首页自动加载第一个预置（同时点亮它的卡片选中态）
 window.addEventListener("load", () => {
-  if (PRESETS.length > 0) {
-    setTimeout(() => loadPreset(0), 500);
-  }
+  if (PRESETS.length === 0) return;
+  setTimeout(() => {
+    const card = presetCards[0];
+    if (card && !selection.has("preset:0")) toggleSelect("preset:0", { kind: "preset", index: 0 }, card);
+    loadSingle({ kind: "preset", index: 0 });
+  }, 500);
 });

@@ -15,12 +15,13 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { ThreeScene, SceneSegment, SceneLeaf, SceneFruit, SceneBranch } from "./scene-types";
 import { buildBranchGeometry, visibleRingCount } from "./branch-geometry";
+import type { ForestScene, ForestTreeMeta } from "./forest-builder";
 
 /** 叶子调色板（索引 12 = 紫色，spec:/hook: 提交；与二维版一致） */
 const LEAF_COLORS = [
   "#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8",
   "#F7DC6F", "#BB8FCE", "#85C1E2", "#F8B88B", "#82E0AA",
-  "#F1948A", "#7FA88A", "#9B59B6",
+  "#F1948A", "#63A06E", "#9B59B6",
 ];
 const WITHERED_COLOR = "#8d6e63";
 const TRUNK_COLOR = 0x2f5d3f;
@@ -37,8 +38,8 @@ const FALL_DURATION = 0.06;
  * 叶/果的基础半径只有 0.3–1.6 单位，直接渲染不足 1px。
  * 放大到肉眼可见、可点击的尺寸（直径约 8–26 单位）。
  */
-const LEAF_SCALE = 8;
-const FRUIT_SCALE = 6;
+const LEAF_SCALE = 11;
+const FRUIT_SCALE = 11;
 
 export type ViewName = "overview" | "side" | "top" | "root";
 
@@ -96,6 +97,10 @@ export class TreeRenderer {
   readonly controls: OrbitControls;
 
   private scene3d: ThreeScene | null = null;
+  /** 森林里的树（单树时长度为 1），供 HTML 名牌定位 */
+  private forest: ForestTreeMeta[] = [];
+  /** 每帧渲染后的回调（HTML 名牌跟随三维位置） */
+  onAfterRender: (() => void) | null = null;
   private branchEntries: BranchEntry[] = [];
   private graftEntries: GraftEntry[] = [];
   private leafGroups: LeafGroup[] = [];
@@ -122,6 +127,7 @@ export class TreeRenderer {
   private raycaster = new THREE.Raycaster();
   private tmpMatrix = new THREE.Matrix4();
   private tmpQuat = new THREE.Quaternion();
+  private tmpEuler = new THREE.Euler();
   private tmpVec = new THREE.Vector3();
   private tmpScale = new THREE.Vector3();
   private upVector = new THREE.Vector3(0, 1, 0);
@@ -187,6 +193,8 @@ export class TreeRenderer {
   setScene(scene: ThreeScene | null): void {
     this.clearScene();
     this.scene3d = scene;
+    const forest = (scene as ForestScene | null)?.trees;
+    this.forest = Array.isArray(forest) ? forest : [];
     if (!scene || scene.segments.length === 0) return;
 
     this.buildGround(scene.radius);
@@ -425,7 +433,13 @@ export class TreeRenderer {
     for (const [shape, items] of byShape) {
       const geo = leafGeometry(shape);
       if (!geo) continue;
-      const mat = new THREE.MeshStandardMaterial({ roughness: 0.88, metalness: 0 });
+      // 叶形几何在 XY 平面（叶长沿 Y）；旋到水平面，再由实例矩阵做方位与俯仰
+      geo.rotateX(-Math.PI / 2);
+      const mat = new THREE.MeshStandardMaterial({
+        roughness: 0.78,
+        metalness: 0,
+        side: THREE.DoubleSide,
+      });
       const mesh = new THREE.InstancedMesh(geo, mat, items.length);
       mesh.frustumCulled = false;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -459,36 +473,33 @@ export class TreeRenderer {
       let color: number;
       let emissive: number;
       if (kind === "major") {
-        geo = new THREE.OctahedronGeometry(1.0, 0);
-        color = GOLD;
-        emissive = 0x6b5200;
+        geo = makeAppleGeometry(1.2);
+        color = 0xd8342b; // 主版本：红苹果
+        emissive = 0x2a0503;
       } else if (kind === "normal") {
-        geo = new THREE.SphereGeometry(0.5, 8, 6);
-        color = GOLD;
-        emissive = 0x554400;
+        geo = makeAppleGeometry(0.92);
+        color = 0xe8a33d; // 普通标签：金苹果
+        emissive = 0x2b1c02;
       } else {
-        geo = new THREE.TetrahedronGeometry(0.6, 0);
-        color = 0x9b59b6;
-        emissive = 0x3d1d56;
+        geo = makeAppleGeometry(0.72);
+        color = 0x9b59b6; // spec:/hook: 紫苹果
+        emissive = 0x2a1140;
       }
       const mat = new THREE.MeshStandardMaterial({
         color,
         emissive,
-        emissiveIntensity: 0.55,
-        roughness: 0.4,
-        metalness: 0.2,
+        emissiveIntensity: 0.3,
+        roughness: 0.42,
+        metalness: 0.06,
+        vertexColors: true,
       });
       const mesh = new THREE.InstancedMesh(geo, mat, items.length);
       mesh.frustumCulled = false;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 
-      const baseColors: THREE.Color[] = [];
-      for (let i = 0; i < items.length; i++) {
-        const c = new THREE.Color(color);
-        baseColors.push(c);
-        mesh.setColorAt(i, c);
-      }
-      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      // 苹果的颜色由材质 + 顶点色（果身白、果柄深褐）决定，
+      // 不再用 instanceColor —— 否则会和顶点色相乘导致颜色失真。
+      const baseColors: THREE.Color[] = items.map(() => new THREE.Color(color));
 
       this.scene.add(mesh);
       this.fruitGroups.push({ mesh, items, baseColors });
@@ -584,10 +595,13 @@ export class TreeRenderer {
           s *= 1 - f;
         }
 
-        // 风动：呼吸 + 自转（t 的确定性函数）
-        s *= 1 + Math.sin(t * Math.PI * 2 * 2 + leaf.phase) * 0.06;
-        const angle = t * 0.6 + leaf.phase;
-        this.tmpQuat.setFromAxisAngle(new THREE.Vector3(...leaf.axis), angle);
+        // 风动：叶片按方位角铺开，只做小幅俯仰与偏摆，不再像螺旋桨那样自转
+        s *= 1 + Math.sin(t * Math.PI * 2 * 2 + leaf.phase) * 0.05;
+        const yaw = leaf.phase * Math.PI * 2 + Math.sin(t * 1.7 + leaf.phase) * 0.14;
+        const tilt = 0.28 + leaf.axis[1] * 0.34 + Math.sin(t * 2.3 + leaf.phase * 2.1) * 0.08;
+        const roll = leaf.axis[0] * 0.6;
+        this.tmpEuler.set(tilt, yaw, roll, "YXZ");
+        this.tmpQuat.setFromEuler(this.tmpEuler);
 
         if (s <= 0) {
           this.tmpScale.set(0, 0, 0);
@@ -613,7 +627,8 @@ export class TreeRenderer {
           continue;
         }
         const fade = Math.min(1, (t - fruit.birth) / 0.2);
-        const s = fruit.size * FRUIT_SCALE * (0.7 + 0.3 * fade) * (1 + Math.sin(t * Math.PI * 2 * 2 + i) * 0.06);
+        const hover = fruit.id === this.hoveredKey ? 1.25 : 1;
+        const s = fruit.size * FRUIT_SCALE * (0.7 + 0.3 * fade) * (1 + Math.sin(t * Math.PI * 2 * 2 + i) * 0.06) * hover;
         this.tmpVec.set(
           fruit.pos[0],
           fruit.pos[1] + Math.sin(t * 2 + i * 0.7) * 3,
@@ -653,6 +668,8 @@ export class TreeRenderer {
     }
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
+    // 通知外部：三维画面已更新（HTML 名牌据此跟随投影位置）
+    this.onAfterRender?.();
   }
 
   /** 视角预设 */
@@ -875,9 +892,9 @@ export class TreeRenderer {
 
   private applyColor(key: string | null, highlight: boolean): void {
     if (!key) return;
-    for (const group of [...this.leafGroups, ...this.fruitGroups]) {
-      const items = "items" in group ? group.items : [];
-      const idx = items.findIndex((it) => it.id === key);
+    // 仅叶子用实例颜色做高亮；果实的颜色来自材质与顶点色，改用放大高亮（见 updateTree）
+    for (const group of this.leafGroups) {
+      const idx = group.items.findIndex((it) => it.id === key);
       if (idx < 0) continue;
       const base = group.baseColors[idx];
       const c = highlight ? base.clone().lerp(new THREE.Color(0xffffff), 0.55) : base;
@@ -946,48 +963,169 @@ export class TreeRenderer {
   }
 
   /** 场景统计（调试/测试钩子） */
-  stats(): { segments: number; branches: number; leaves: number; fruits: number } {
+  stats(): { segments: number; branches: number; leaves: number; fruits: number; trees: number } {
     return {
       segments: this.scene3d?.segments.length ?? 0,
       branches: this.scene3d?.branches.length ?? 0,
       leaves: this.scene3d?.leaves.length ?? 0,
       fruits: this.scene3d?.fruits.length ?? 0,
+      trees: this.forest.length,
+    };
+  }
+
+  /** 每棵树的树冠锚点（世界坐标），HTML 名牌用 */
+  treeAnchors(): Array<{ x: number; y: number; z: number; index: number }> {
+    return this.forest.map((t) => ({
+      index: t.index,
+      x: t.x,
+      y: t.height * 1.02 + 40,
+      z: t.z,
+    }));
+  }
+
+  /** 世界坐标 → 画布内像素坐标（不可见时 visible=false） */
+  projectToScreen(point: { x: number; y: number; z: number }): {
+    x: number;
+    y: number;
+    visible: boolean;
+  } {
+    const v = this.tmpVec.set(point.x, point.y, point.z).project(this.camera);
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    return {
+      x: ((v.x + 1) / 2) * rect.width,
+      y: ((1 - v.y) / 2) * rect.height,
+      visible: v.z > -1 && v.z < 1,
     };
   }
 }
 
 /** 形状 → 单位几何（半径约 0.5，实例矩阵再缩放） */
+/** 给几何体刷上统一顶点色（与实例色相乘时作为「部件固有色」） */
+function paintGeometry(geo: THREE.BufferGeometry, color: [number, number, number]): THREE.BufferGeometry {
+  const count = geo.getAttribute("position").count;
+  const arr = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    arr[i * 3] = color[0];
+    arr[i * 3 + 1] = color[1];
+    arr[i * 3 + 2] = color[2];
+  }
+  geo.setAttribute("color", new THREE.BufferAttribute(arr, 3));
+  return geo;
+}
+
+/**
+ * 真实叶片：用 Shape 贝塞尔曲线勾出叶形（基部渐窄 → 中部最宽 → 叶尖收拢），
+ * 再挤出 5% 叶长的厚度并沿中脉上拱，避免「一片平板」的塑料感。
+ * 几何以叶心为原点，叶长沿 Y，厚度沿 Z（渲染时旋到水平）。
+ */
+function makeLeafGeometry(width: number, curl = 0.16): THREE.BufferGeometry {
+  const w = width * 0.5;
+  const shape = new THREE.Shape();
+  shape.moveTo(0, -0.5); // 叶柄端
+  shape.bezierCurveTo(w * 0.55, -0.34, w, -0.05, w * 0.92, 0.22);
+  shape.bezierCurveTo(w * 0.78, 0.42, w * 0.34, 0.5, 0, 0.54); // 叶尖
+  shape.bezierCurveTo(-w * 0.34, 0.5, -w * 0.78, 0.42, -w * 0.92, 0.22);
+  shape.bezierCurveTo(-w, -0.05, -w * 0.55, -0.34, 0, -0.5);
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth: 0.04,
+    bevelEnabled: true,
+    bevelThickness: 0.015,
+    bevelSize: 0.02,
+    bevelSegments: 1,
+    steps: 1,
+    curveSegments: 5,
+  });
+  geo.center();
+
+  // 叶面上拱 + 叶尖略垂，叶缘比中脉低 → 有厚度的真叶观感
+  const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const edge = Math.min(1, Math.abs(x) / Math.max(1e-4, w));
+    pos.setZ(i, pos.getZ(i) + curl * (1 - edge) * 0.12 - Math.abs(y) * 0.05);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/**
+ * 苹果：压扁的球体 + 顶部果脐凹陷 + 深色果柄。
+ * 果身顶点色为白（由材质决定红/金/紫），果柄顶点色深褐。
+ */
+function makeAppleGeometry(scale = 1): THREE.BufferGeometry {
+  const body = new THREE.SphereGeometry(0.5, 16, 12);
+  const pos = body.getAttribute("position") as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    if (y > 0.3) {
+      // 果脐：顶部向内凹
+      const k = Math.min(1, (y - 0.3) / 0.2);
+      pos.setY(i, y - k * 0.1);
+    } else if (y < -0.32) {
+      // 底部略微收平
+      const k = Math.min(1, (-0.32 - y) / 0.18);
+      pos.setY(i, y + k * 0.05);
+    }
+  }
+  pos.needsUpdate = true;
+  body.scale(1, 0.93, 1);
+  body.computeVertexNormals();
+  paintGeometry(body, [1, 1, 1]);
+
+  const stem = new THREE.CylinderGeometry(0.022, 0.045, 0.4, 6);
+  stem.translate(0, 0.42, 0);
+  stem.rotateZ(0.14);
+  paintGeometry(stem, [0.16, 0.12, 0.1]);
+
+  const merged = mergeGeometries([body, stem]) || body;
+  if (scale !== 1) merged.scale(scale, scale, scale);
+  return merged;
+}
+
 function leafGeometry(shape: string): THREE.BufferGeometry | null {
   switch (shape) {
     case "circle":
-      return new THREE.SphereGeometry(0.5, 8, 6);
+      return makeLeafGeometry(0.78);
     case "pointed":
-      return new THREE.ConeGeometry(0.5, 1.1, 6);
-    case "long": {
-      const g = new THREE.CapsuleGeometry(0.32, 0.9, 3, 6);
-      g.rotateZ(Math.PI / 2);
+      return makeLeafGeometry(0.52, 0.2);
+    case "long":
+      return makeLeafGeometry(0.34, 0.22);
+    case "small":
+      return makeLeafGeometry(0.6);
+    case "tiny":
+      return makeLeafGeometry(0.66);
+    case "withered": {
+      // 枯萎叶：更窄、更卷
+      const g = makeLeafGeometry(0.46, 0.46);
+      g.rotateZ(0.45);
       return g;
     }
     case "triple": {
-      const a = new THREE.SphereGeometry(0.3, 6, 5);
-      a.translate(-0.45, 0, 0);
-      const b = new THREE.SphereGeometry(0.3, 6, 5);
-      b.translate(0.45, 0, 0);
-      const c = new THREE.SphereGeometry(0.3, 6, 5);
-      c.translate(0, 0.45, 0);
-      return mergeGeometries([a, b, c]) || new THREE.SphereGeometry(0.4, 6, 5);
+      // 三出复叶：三片小叶共柄
+      const angles = [-0.55, 0, 0.55];
+      const parts = angles.map((a) => {
+        const l = makeLeafGeometry(0.42, 0.18);
+        l.scale(0.7, 0.7, 0.7);
+        l.rotateZ(a);
+        l.translate(Math.sin(a) * 0.2, 0.3, 0);
+        return l;
+      });
+      return mergeGeometries(parts) || makeLeafGeometry(0.5);
     }
-    case "small":
-      return new THREE.SphereGeometry(0.4, 6, 5);
-    case "tiny":
-      return new THREE.SphereGeometry(0.28, 6, 5);
-    case "withered": {
-      const g = new THREE.SphereGeometry(0.45, 6, 5);
-      g.scale(1, 1, 0.45);
-      return g;
+    case "purple": {
+      // 五瓣小花（spec:/hook: 提交）
+      const petals = Array.from({ length: 5 }, (_, i) => {
+        const p = makeLeafGeometry(0.5, 0.1);
+        p.scale(0.4, 0.4, 0.4);
+        p.rotateZ((i / 5) * Math.PI * 2);
+        p.translate(Math.cos((i / 5) * Math.PI * 2) * 0.06, Math.sin((i / 5) * Math.PI * 2) * 0.06, 0);
+        return p;
+      });
+      return mergeGeometries(petals) || makeLeafGeometry(0.5);
     }
-    case "purple":
-      return new THREE.IcosahedronGeometry(0.5, 0);
     default:
       return null;
   }

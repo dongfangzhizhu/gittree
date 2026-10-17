@@ -156,6 +156,20 @@ const VIEWS = [
 ];
 
 /** 拖动时间轴到指定百分比 */
+/** 等相机过渡真正停下（固定 sleep 在长距离切换时会不够） */
+async function waitCameraSettled(timeout = 4000) {
+  const start = Date.now();
+  let last = null;
+  while (Date.now() - start < timeout) {
+    const cam = await page.evaluate(() => window.__gittree.getCamera());
+    const key = cam ? cam.position.map((v) => Math.round(v)).join(",") : "";
+    if (last === key) return true;
+    last = key;
+    await page.waitForTimeout(160);
+  }
+  return false;
+}
+
 async function seek(pct) {
   await page.evaluate((v) => {
     const slider = document.getElementById("timeSlider");
@@ -177,16 +191,20 @@ async function setPlaying(playing) {
 /** 依次点击候选节点的屏幕投影，命中即关闭面板并返回结果 */
 async function tryClickAnyNode() {
   const keys = [
-    ...(await page.evaluate(() => window.__gittree.sampleLeafKeys(28))),
-    ...(await page.evaluate(() => window.__gittree.sampleFruitKeys(10))),
+    ...(await page.evaluate(() => window.__gittree.sampleLeafKeys(140))),
+    ...(await page.evaluate(() => window.__gittree.sampleFruitKeys(24))),
   ];
   let tried = 0;
+  // 画布可能在首屏之下：先把画布滚进视口，再按实际视口范围过滤候选点
+  await page.locator(".canvas-container").scrollIntoViewIfNeeded();
+  await page.waitForTimeout(120);
+  const vp = page.viewportSize();
   for (const key of keys) {
     const pos = await page.evaluate((k) => window.__gittree.nodeScreenPos(k), key);
     if (!pos) continue;
     const x = Math.round(pos.x);
     const y = Math.round(pos.y);
-    if (x < 4 || y < 4 || x > 1436 || y > 896) continue;
+    if (x < 4 || y < 4 || x > vp.width - 4 || y > vp.height - 4) continue;
     tried++;
     await page.mouse.click(x, y);
     await page.waitForTimeout(110);
@@ -219,7 +237,7 @@ for (const playing of [false, true]) {
   for (const view of VIEWS) {
     await setPlaying(false);
     await page.click(`[data-view="${view.key}"]`);
-    await page.waitForTimeout(1300); // 等相机过渡完成
+    await waitCameraSettled();
     await seek(90);
     await setPlaying(playing);
 

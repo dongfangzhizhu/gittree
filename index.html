@@ -365,6 +365,7 @@
     }
 
     .preset-card {
+      position: relative;
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 12px;
@@ -402,6 +403,136 @@
 
     .preset-card.snapshot-card {
       background: linear-gradient(150deg, rgba(78, 205, 196, 0.06), rgba(255, 255, 255, 0.02));
+    }
+
+    /* 选中态：与未选中明确区分（描边 + 底色 + 光晕 + 勾选角标） */
+    .preset-card.selected {
+      border-color: var(--accent);
+      background: linear-gradient(150deg, rgba(78, 205, 196, 0.22), rgba(69, 183, 209, 0.1));
+      box-shadow: 0 0 0 1px rgba(78, 205, 196, 0.55), 0 10px 26px rgba(78, 205, 196, 0.18);
+      transform: translateY(-2px);
+    }
+
+    .preset-card.selected::after {
+      content: "✓";
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #04231f;
+      font-size: 13px;
+      font-weight: 900;
+      line-height: 20px;
+      text-align: center;
+      box-shadow: 0 2px 8px rgba(78, 205, 196, 0.5);
+    }
+
+    .preset-card.selected > div:first-child {
+      color: #9ff2ea;
+    }
+
+    /* ===== 森林操作条 ===== */
+    .forest-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 12px 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+    }
+
+    .forest-bar .forest-count {
+      font-size: 13px;
+      color: var(--dim);
+    }
+
+    .forest-bar .forest-count strong {
+      color: var(--accent);
+      font-size: 15px;
+    }
+
+    .forest-bar .forest-hint {
+      font-size: 12px;
+      color: var(--dim);
+      opacity: 0.75;
+      margin-left: auto;
+    }
+
+    .forest-bar button {
+      padding: 9px 16px;
+      font-size: 13px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-strong);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .forest-bar button.primary {
+      background: linear-gradient(135deg, #7ef0e6, var(--accent));
+      color: #04231f;
+      font-weight: 800;
+      border-color: transparent;
+    }
+
+    .forest-bar button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    /* ===== 三维名牌（跟随树的 HTML 标签） ===== */
+    .tree-labels {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 3;
+    }
+
+    .tree-label {
+      position: absolute;
+      transform: translate(-50%, -100%);
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(78, 205, 196, 0.35);
+      background: rgba(6, 12, 26, 0.72);
+      backdrop-filter: blur(6px);
+      color: #cfe9e6;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      transition: opacity 0.2s, border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+      pointer-events: auto;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .tree-label:hover {
+      border-color: rgba(78, 205, 196, 0.85);
+      box-shadow: 0 4px 16px rgba(78, 205, 196, 0.28);
+    }
+
+    /* 焦点树的名牌高亮 */
+    .tree-label.focused {
+      border-color: var(--accent);
+      background: linear-gradient(150deg, rgba(78, 205, 196, 0.92), rgba(69, 183, 209, 0.85));
+      color: #04231f;
+      box-shadow: 0 6px 20px rgba(78, 205, 196, 0.35);
+    }
+
+    .tree-label.focused .tree-commits {
+      color: rgba(4, 35, 31, 0.72);
+    }
+
+    .tree-label .tree-commits {
+      font-weight: 400;
+      color: var(--dim);
+      margin-left: 6px;
+      font-size: 11px;
     }
 
     /* ===== 舞台 ===== */
@@ -805,8 +936,8 @@
         <input
           type="text"
           id="repoInput"
-          placeholder="输入 GitHub 仓库地址，如 facebook/react 或 https://github.com/facebook/react"
-          aria-label="GitHub 仓库地址"
+          placeholder="输入一个或多个仓库，如 facebook/react, vuejs/core（逗号分隔）"
+          aria-label="GitHub 仓库地址，可输入多个"
         />
         <button id="loadBtn">让它生长</button>
         <button id="cancelBtn" class="ghost" style="display: none;">⏹ 取消</button>
@@ -841,9 +972,17 @@
 
     <section id="presets" class="presets"></section>
 
+    <div class="forest-bar" id="forestBar">
+      <span class="forest-count" id="forestCount">已选 <strong>0</strong> 个项目</span>
+      <button id="growForestBtn" class="primary" disabled>🌱 生长这片森林</button>
+      <button id="clearSelectionBtn" class="ghost">清空选择</button>
+      <span class="forest-hint" id="forestHint">点卡片可多选；也可在上方输入多个仓库（逗号或换行分隔）</span>
+    </div>
+
     <main class="stage">
       <div class="canvas-container" id="canvasContainer">
         <canvas id="canvas"></canvas>
+        <div class="tree-labels" id="treeLabels"></div>
 
         <div class="hud hud-tl">
           <div class="hud-chapter" id="hudChapter">萌芽期</div>
