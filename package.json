@@ -1,18 +1,21 @@
 {
   "name": "gittree",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "代码年轮 - 用树形可视化展示 Git 仓库的提交历史",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest"
   },
-  "keywords": [],
+  "keywords": ["git", "visualization", "tree", "github"],
   "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "license": "MIT",
   "devDependencies": {
     "@types/node": "^26.6.5",
     "typescript": "^7.0.2",
-    "vite": "^8.3.4"
+    "vite": "^8.3.4",
+    "vitest": "^1.0.0"
   }
 }
