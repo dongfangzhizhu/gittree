@@ -431,8 +431,24 @@ function render() {
 
   const t = Math.max(0, Math.min(1, state.currentTime / state.duration));
 
-  // 调整 canvas 尺寸
-  const rect = canvasContainer.getBoundingClientRect();
+  // 调整 canvas 尺寸，使用防守性编程
+  let rect = canvasContainer.getBoundingClientRect();
+  
+  // 如果容器尺寸为 0，使用备用值
+  if (rect.width === 0 || rect.height === 0) {
+    const containerStyle = window.getComputedStyle(canvasContainer);
+    rect = {
+      width: parseFloat(containerStyle.width) || 800,
+      height: parseFloat(containerStyle.height) || 450,
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    };
+  }
   canvas.width = rect.width * window.devicePixelRatio;
   canvas.height = rect.height * window.devicePixelRatio;
   ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
@@ -527,6 +543,7 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+
 
 
 
