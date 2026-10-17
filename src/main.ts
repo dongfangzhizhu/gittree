@@ -13,6 +13,7 @@ import { parseGitHubInput } from "./core/input-parser";
 import { PRESETS } from "./presets";
 import { createTokenUI } from "./ui/token-ui";
 import { formatErrorForUI } from "./ui/error-handler";
+import { checkBrowserSupport, getExportWarnings } from "./ui/browser-check";
 
 interface AppState {
   isLoading: boolean;
@@ -34,6 +35,13 @@ const state: AppState = {
   duration: 30,
   speed: 1,
 };
+
+// 浏览器兼容性检查
+const browserSupport = checkBrowserSupport();
+const warnings = getExportWarnings(browserSupport);
+if (warnings.length > 0) {
+  console.warn("Browser support warnings:", warnings);
+}
 
 // Token UI 初始化
 const tokenUI = createTokenUI();
@@ -191,6 +199,10 @@ async function loadPreset(index: number) {
  * 导出视频 (WebM)
  */
 async function exportVideo() {
+  if (!browserSupport.canExportVideo) {
+    showError("Video export not supported in this browser. Try Chrome, Edge, or Firefox.");
+    return;
+  }
   if (!state.geometry || !canvas) {
     showError("没有可导出的树");
     return;
@@ -255,6 +267,10 @@ async function exportVideo() {
  * 导出纪念卡 (PNG)
  */
 async function exportCard() {
+  if (!browserSupport.canExportCard) {
+    showError("Card export not supported in this browser. Please update your browser.");
+    return;
+  }
   if (!state.geometry || !canvas) {
     showError("没有可导出的树");
     return;
@@ -477,6 +493,7 @@ window.addEventListener("load", () => {
     setTimeout(() => loadPreset(0), 500);
   }
 });
+
 
 
 
