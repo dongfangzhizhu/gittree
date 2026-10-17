@@ -3,7 +3,7 @@
  * 无副作用，不依赖 Date.now 或 Math.random
  */
 
-import { GrowthModel, TreeGeometry, TreeSegment, TreeLeaf } from "../core/types";
+import { GrowthModel, TreeGeometry, TreeSegment, TreeLeaf, TreeFlower } from "../core/types";
 import { seededRandom } from "./prng";
 
 export interface LayoutOptions {
@@ -23,7 +23,7 @@ export function layout(
 
   const segments: TreeSegment[] = [];
   const leaves: TreeLeaf[] = [];
-  const flowers = [];
+  const flowers: TreeFlower[] = [];
 
   // 简化布局：每个提交对应一个向上的线段
   const commitCount = model.commits.length;
@@ -64,6 +64,26 @@ export function layout(
     });
   }
 
+  // 添加标签花
+  for (let i = 0; i < model.tags.length; i++) {
+    const tag = model.tags[i];
+    const commitIdx = model.commits.findIndex((c) => c.id === tag.commitId);
+    if (commitIdx >= 0) {
+      const t = commitIdx / Math.max(1, commitCount - 1);
+      const x = width / 2 + (seededRandom(tag.name, 0) - 0.5) * 60;
+      const y = height - 100 - commitIdx * segmentHeight - segmentHeight / 2;
+
+      flowers.push({
+        id: `flower-${i}`,
+        tag: tag.name,
+        pos: [x, y],
+        size: 1.0,
+        birth: t,
+        kind: tag.name.match(/^v?\d+\.0/) ? "major" : "normal",
+      });
+    }
+  }
+
   // 时间映射：线性映射
   const timeMap: Array<[number, number]> = [
     [0, model.commits[0].time],
@@ -76,7 +96,7 @@ export function layout(
     segments,
     leaves,
     flowers,
-    chapters: model.chapters.map((ch, idx) => ({
+    chapters: model.chapters.map((ch) => ({
       title: ch.title,
       season: ch.season,
       t0: ch.startIndex / commitCount,
@@ -99,6 +119,8 @@ function getLeafShape(type: string): string {
     other: "tiny",
     merge: "none",
     revert: "withered",
+    spec: "purple",
+    hook: "purple",
   };
   return shapes[type] || "circle";
 }
