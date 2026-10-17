@@ -26,6 +26,8 @@ jobs:
       - run: npm ci
       - run: npm test --if-present
       - run: npm run build
+        env:
+          BASE_PATH: /gittree/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
