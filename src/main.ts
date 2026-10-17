@@ -4,12 +4,13 @@
  */
 
 import { GitHubSource } from "./core/github-source";
-import { normalizeCommits, detectCommitType, associateTags } from "./core/normalize";
+import { normalizeCommits, associateTags } from "./core/normalize";
 import { sampleCommits, reconnectParents } from "./core/sampler";
 import { buildGrowthModel } from "./core/growth-model";
 import { layout } from "./layout/tree-layout";
 import { renderFrame } from "./rendering/canvas-renderer";
 import { parseGitHubInput } from "./core/input-parser";
+import { PRESETS } from "./presets";
 
 interface AppState {
   isLoading: boolean;
@@ -45,6 +46,7 @@ const canvasContainer = document.getElementById("canvasContainer") as HTMLElemen
 const controls = document.getElementById("controls") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 const errorBox = document.getElementById("errorBox") as HTMLElement;
+const presetsContainer = document.getElementById("presets") as HTMLElement;
 
 const ctx = canvas.getContext("2d");
 let animationFrameId: number | null = null;
@@ -62,6 +64,33 @@ durationSelect.addEventListener("change", (e) => {
 timeSlider.addEventListener("input", (e) => {
   state.currentTime = (parseFloat((e.target as HTMLInputElement).value) / 100) * state.duration;
   render();
+});
+
+// 键盘快捷键
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (state.isPlaying) pausePlayback();
+    else startPlayback();
+  }
+  if (e.code === "ArrowLeft") {
+    state.currentTime = Math.max(0, state.currentTime - 1);
+    render();
+  }
+  if (e.code === "ArrowRight") {
+    state.currentTime = Math.min(state.duration, state.currentTime + 1);
+    render();
+  }
+  if (e.code === "Home") {
+    state.currentTime = 0;
+    pausePlayback();
+    render();
+  }
+  if (e.code === "End") {
+    state.currentTime = state.duration;
+    pausePlayback();
+    render();
+  }
 });
 
 /**
@@ -113,12 +142,202 @@ async function loadRepository() {
 
     showStatus(`已加载 ${model.commits.length} 个提交（${Math.floor(samplingRate * 100)}% 采样）`);
     showCanvas();
+    startPlayback(); // 自动播放
     render();
   } catch (error: any) {
     showError(error.message || "加载失败");
   } finally {
     state.isLoading = false;
     loadBtn.disabled = false;
+  }
+}
+
+/**
+ * 加载预置
+ */
+async function loadPreset(index: number) {
+  try {
+    state.isLoading = true;
+    showStatus("正在加载预置作品...");
+    clearError();
+
+    const preset = PRESETS[index];
+    const model = preset.load();
+
+    // 生成布局
+    const geometry = layout(model);
+
+    state.model = model;
+    state.geometry = geometry;
+
+    showStatus(`已加载 ${model.commits.length} 个提交`);
+    showCanvas();
+    startPlayback();
+    render();
+  } catch (error: any) {
+    showError(error.message || "加载预置失败");
+  } finally {
+    state.isLoading = false;
+  }
+}
+
+/**
+ * 导出视频 (WebM)
+ */
+async function exportVideo() {
+  if (!state.geometry || !canvas) {
+    showError("没有可导出的树");
+    return;
+  }
+
+  try {
+    showStatus("正在导出视频...");
+    loadBtn.disabled = true;
+
+    const duration = state.duration * 1000;
+    const fps = 30;
+    const frameCount = (duration / 1000) * fps;
+
+    // 创建离屏 canvas
+    const offCanvas = document.createElement("canvas");
+    offCanvas.width = 1920;
+    offCanvas.height = 1080;
+    const offCtx = offCanvas.getContext("2d");
+    if (!offCtx) throw new Error("无法创建离屏 canvas");
+
+    // 获取录制流
+    const stream = offCanvas.captureStream(fps);
+    const mediaRecorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    const chunks: Blob[] = [];
+
+    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(chunks, { type: "video/webm" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `tree-${new Date().toISOString().split("T")[0]}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showStatus("导出完成");
+      loadBtn.disabled = false;
+    };
+
+    mediaRecorder.start();
+
+    // 逐帧渲染
+    for (let frame = 0; frame < frameCount; frame++) {
+      const t = frame / frameCount;
+      renderFrame(offCtx, state.geometry, t, {
+        width: 1920,
+        height: 1080,
+        dpr: 1,
+        theme: "dark",
+        sway: false, // 关闭风动以加快导出
+      });
+      showStatus(`导出中... ${Math.floor((frame / frameCount) * 100)}%`);
+    }
+
+    mediaRecorder.stop();
+  } catch (error: any) {
+    showError(`导出失败: ${error.message}`);
+    loadBtn.disabled = false;
+  }
+}
+
+/**
+ * 导出纪念卡 (PNG)
+ */
+async function exportCard() {
+  if (!state.geometry || !canvas) {
+    showError("没有可导出的树");
+    return;
+  }
+
+  try {
+    showStatus("正在导出纪念卡...");
+
+    // 创建竖版 canvas (1080×1350)
+    const cardCanvas = document.createElement("canvas");
+    cardCanvas.width = 1080;
+    cardCanvas.height = 1350;
+    const cardCtx = cardCanvas.getContext("2d");
+    if (!cardCtx) throw new Error("无法创建 canvas");
+
+    // 深色背景
+    cardCtx.fillStyle = "#0a0e27";
+    cardCtx.fillRect(0, 0, 1080, 1350);
+
+    // 顶部文字
+    cardCtx.fillStyle = "#ffffff";
+    cardCtx.font = "bold 32px Arial";
+    cardCtx.fillText(
+      `${state.model.source.owner}/${state.model.source.repo}`,
+      50,
+      60
+    );
+
+    cardCtx.font = "16px Arial";
+    cardCtx.fillStyle = "#aaa";
+    const days = state.model.stats.days;
+    const growthMsg =
+      days < 90 ? "刚刚发芽" : days < 730 ? "正在拔节" : "已经成林";
+    cardCtx.fillText(`已经生长 ${days} 天 · ${growthMsg}`, 50, 100);
+
+    // 中部：完整的树 (t=1)
+    renderFrame(cardCtx, state.geometry, 1.0, {
+      width: 1080,
+      height: 800,
+      dpr: 1,
+      theme: "dark",
+      sway: false,
+    });
+
+    // 下部：统计数据 (2×3 格子)
+    const stats = [
+      [`首次提交`, new Date(state.model.stats.firstTime).toLocaleDateString()],
+      [`总提交数`, state.model.stats.totalCommits.toString()],
+      [`贡献者`, state.model.stats.contributors.toString()],
+      [`最活跃`, state.model.stats.busiestDay.date],
+      [`最长沉寂`, `${state.model.stats.longestDormancy.days} 天`],
+      [`章节数`, state.model.chapters.length.toString()],
+    ];
+
+    cardCtx.fillStyle = "#ffffff";
+    cardCtx.font = "14px Arial";
+    let idx = 0;
+    for (let row = 0; row < 2; row++) {
+      for (let col = 0; col < 3; col++) {
+        const x = 50 + col * 320;
+        const y = 1050 + row * 100;
+        const [label, value] = stats[idx++];
+
+        cardCtx.fillStyle = "#666";
+        cardCtx.fillText(label, x, y);
+        cardCtx.fillStyle = "#4ecdc4";
+        cardCtx.font = "bold 18px Arial";
+        cardCtx.fillText(value, x, y + 40);
+      }
+    }
+
+    // 底部
+    cardCtx.fillStyle = "#555";
+    cardCtx.font = "12px Arial";
+    cardCtx.fillText("由代码年轮生成 · https://github.com/yourusername/gittree", 50, 1320);
+
+    // 下载
+    cardCanvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `card-${new Date().toISOString().split("T")[0]}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showStatus("纪念卡已导出");
+    });
+  } catch (error: any) {
+    showError(`导出失败: ${error.message}`);
   }
 }
 
@@ -220,5 +439,35 @@ function clearError() {
   errorBox.style.display = "none";
 }
 
+/**
+ * 初始化预置
+ */
+function initPresets() {
+  presetsContainer.innerHTML = "";
+  for (let i = 0; i < PRESETS.length; i++) {
+    const preset = PRESETS[i];
+    const card = document.createElement("div");
+    card.className = "preset-card";
+    card.innerHTML = `<div>${preset.name}</div><strong>${preset.description}</strong>`;
+    card.addEventListener("click", () => loadPreset(i));
+    presetsContainer.appendChild(card);
+  }
+  presetsContainer.style.display = "grid";
+}
+
 // 初始化
 window.addEventListener("resize", render);
+initPresets();
+
+// 添加导出按钮事件（假设存在 HTML 中）
+const exportVideoBtn = document.querySelector("[data-action=export-video]") as HTMLButtonElement;
+const exportCardBtn = document.querySelector("[data-action=export-card]") as HTMLButtonElement;
+if (exportVideoBtn) exportVideoBtn.addEventListener("click", exportVideo);
+if (exportCardBtn) exportCardBtn.addEventListener("click", exportCard);
+
+// 首页自动加载第一个预置
+window.addEventListener("load", () => {
+  if (PRESETS.length > 0) {
+    setTimeout(() => loadPreset(0), 500);
+  }
+});
