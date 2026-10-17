@@ -37,13 +37,13 @@ export class GitHubSource implements HistorySource {
       const linkHeader = firstPageResponse.headers?.get("link") || "";
       const totalPages = this.extractLastPage(linkHeader) || 1;
 
-      // Step 3: 确定要获取的页码
+      // Step 3: 确定要获取的页码（第 1 页已取到，跳过避免重复请求）
       const pagesToFetch =
         totalPages <= this.maxPages
-          ? Array.from({ length: totalPages }, (_, i) => i + 1)
-          : this.getEquidistantPages(totalPages, this.maxPages);
+          ? Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) => i + 2)
+          : this.getEquidistantPages(totalPages, this.maxPages).filter((p) => p !== 1);
 
-      // Step 4: 并行获取所有页的提交
+      // Step 4: 并行获取其余页的提交（含已取到的第 1 页）
       const commitResponses = await Promise.all(
         pagesToFetch.map((page) =>
           this.fetchWithRetry(
@@ -54,7 +54,10 @@ export class GitHubSource implements HistorySource {
         )
       );
 
-      const allCommits = commitResponses.flatMap((response) => response.data || []);
+      const allCommits = [
+        ...(firstPageResponse.data || []),
+        ...commitResponses.flatMap((response) => response.data || []),
+      ];
 
       // Step 5: 获取标签（最多 3 页）
       const tagsResponses = await Promise.all(
@@ -101,10 +104,12 @@ export class GitHubSource implements HistorySource {
       if (error?.status === 404) {
         throw new AppError("NOT_FOUND", "仓库未找到", 404);
       }
-      if (error?.status === 403) {
-        const remaining = error?.headers?.["x-ratelimit-remaining"];
+      // 403/429 且限额耗尽 → RATE_LIMITED（FR-IN-05）
+      // 注意：headers 是 Headers 实例，必须用 get()，下标访问永远取不到值
+      if (error?.status === 403 || error?.status === 429) {
+        const remaining = error?.headers?.get?.("x-ratelimit-remaining");
         if (remaining === "0") {
-          const resetTime = parseInt(error?.headers?.["x-ratelimit-reset"] || "0");
+          const resetTime = parseInt(error?.headers?.get?.("x-ratelimit-reset") || "0", 10);
           const waitSeconds = Math.max(0, resetTime - Math.floor(Date.now() / 1000));
           throw new AppError(
             "RATE_LIMITED",
@@ -113,7 +118,9 @@ export class GitHubSource implements HistorySource {
             waitSeconds
           );
         }
-        throw new AppError("FORBIDDEN", "无法访问该仓库", 403);
+        if (error?.status === 403) {
+          throw new AppError("FORBIDDEN", "无法访问该仓库", 403);
+        }
       }
       throw new AppError("NETWORK", error?.message || "网络请求失败");
     }
@@ -146,8 +153,14 @@ export class GitHubSource implements HistorySource {
 
         const data = await response.json();
         return { data, headers: response.headers };
-      } catch (error) {
-        if (i === retries) throw error;
+      } catch (error: any) {
+        // 4xx（除 429 限流）不重试；仅网络错误与 429/5xx 重试一次
+        const status = error?.status;
+        const retryable =
+          error?.name === "AbortError" ? false
+          : error instanceof TypeError ? true // fetch 网络错误
+          : status === 429 || (status !== undefined && status >= 500);
+        if (i === retries || !retryable) throw error;
         // 退避 800ms 后重试
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
@@ -158,8 +171,10 @@ export class GitHubSource implements HistorySource {
     const lastLink = linkHeader.split(",").find((link) => link.includes('rel="last"'));
     if (!lastLink) return null;
 
-    const match = lastLink.match(/page=(\d+)/);
-    return match ? parseInt(match[1]) : null;
+    // 必须匹配查询参数中的 page=，不能用 /page=(\d+)/——
+    // 那会先命中 per_page=100 里的 "page=100"，把总页数误判为 100
+    const match = lastLink.match(/[?&]page=(\d+)/);
+    return match ? parseInt(match[1], 10) : null;
   }
 
   private getEquidistantPages(total: number, count: number): number[] {

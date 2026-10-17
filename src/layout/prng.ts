@@ -12,14 +12,14 @@ export function mulberry32(seed: number) {
 }
 
 /**
- * 将字符串哈希为 32 位整数
+ * 将字符串哈希为 32 位非负整数
  */
 export function hash32(str: string): number {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     const char = str.charCodeAt(i);
     hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
+    hash |= 0; // 保持 32 位有符号整数（原 hash & hash 是空操作）
   }
   return Math.abs(hash);
 }

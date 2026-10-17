@@ -10,6 +10,7 @@ import { buildGrowthModel } from "./core/growth-model";
 import { layout } from "./layout/tree-layout";
 import { renderFrame } from "./rendering/canvas-renderer";
 import { parseGitHubInput } from "./core/input-parser";
+import { AppError, ErrorMessages } from "./core/errors";
 import { PRESETS } from "./presets";
 import { createTokenUI } from "./ui/token-ui";
 import { formatErrorForUI } from "./ui/error-handler";
@@ -64,8 +65,8 @@ const controls = document.getElementById("controls") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 const errorBox = document.getElementById("errorBox") as HTMLElement;
 const presetsContainer = document.getElementById("presets") as HTMLElement;
+const exportArea = document.getElementById("exportArea") as HTMLElement;
 const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement | null;
-const prevLine = document.getElementById("presets") as HTMLElement;
 
 const ctx = canvas.getContext("2d");
 let animationFrameId: number | null = null;
@@ -74,6 +75,14 @@ let animationFrameId: number | null = null;
 loadBtn.addEventListener("click", loadRepository);
 playBtn.addEventListener("click", () => startPlayback());
 pauseBtn.addEventListener("click", () => pausePlayback());
+if (cancelBtn) {
+  cancelBtn.addEventListener("click", () => {
+    if (loadAbortController) {
+      loadAbortController.abort();
+      showStatus("已取消加载");
+    }
+  });
+}
 speedSelect.addEventListener("change", (e) => {
   state.speed = parseFloat((e.target as HTMLSelectElement).value);
 });
@@ -82,6 +91,8 @@ durationSelect.addEventListener("change", (e) => {
 });
 timeSlider.addEventListener("input", (e) => {
   state.currentTime = (parseFloat((e.target as HTMLInputElement).value) / 100) * state.duration;
+  // 拖动时间轴时暂停，否则动画帧会立刻覆盖拖动结果
+  pausePlayback();
   render();
 });
 
@@ -142,6 +153,9 @@ const signal = loadAbortController.signal;
 
     // 规范化提交
     const normalized = normalizeCommits(raw);
+    if (normalized.length === 0) {
+      throw new AppError("EMPTY_REPO", ErrorMessages.EMPTY_REPO.message, 404);
+    }
     const tagMap = associateTags(normalized, raw.tags);
     const taggedIds = new Set(Array.from(tagMap.keys()));
 
@@ -161,11 +175,15 @@ const signal = loadAbortController.signal;
     state.model = model;
     state.geometry = geometry;
 
+    // 重置播放进度：新树从 t=0 开始生长
+    pausePlayback();
+    state.currentTime = 0;
+
     // 更新 URL 以便分享
-const sourceRepo = model.source?.repo ? `${model.source.owner}/${model.source.repo}` : "";
-if (sourceRepo && !window.location.search.includes(sourceRepo)) {
-  window.history.replaceState({}, "", `?repo=${encodeURIComponent(sourceRepo)}`);
-}
+    const sourceRepo = model.source?.repo ? `${model.source.owner}/${model.source.repo}` : "";
+    if (sourceRepo && !window.location.search.includes(sourceRepo)) {
+      window.history.replaceState({}, "", `?repo=${encodeURIComponent(sourceRepo)}`);
+    }
 
     showStatus(`已加载 ${model.commits.length} 个提交（${Math.floor(samplingRate * 100)}% 采样）`);
     showCanvas();
@@ -199,11 +217,15 @@ async function loadPreset(index: number) {
     state.model = model;
     state.geometry = geometry;
 
+    // 重置播放进度：新树从 t=0 开始生长
+    pausePlayback();
+    state.currentTime = 0;
+
     // 更新 URL 以便分享
-const sourceRepo = model.source?.repo ? `${model.source.owner}/${model.source.repo}` : "";
-if (sourceRepo && !window.location.search.includes(sourceRepo)) {
-  window.history.replaceState({}, "", `?repo=${encodeURIComponent(sourceRepo)}`);
-}
+    const sourceRepo = model.source?.repo ? `${model.source.owner}/${model.source.repo}` : "";
+    if (sourceRepo && !window.location.search.includes(sourceRepo)) {
+      window.history.replaceState({}, "", `?repo=${encodeURIComponent(sourceRepo)}`);
+    }
 
     showStatus(`已加载 ${model.commits.length} 个提交`);
     showCanvas();
@@ -219,13 +241,15 @@ if (sourceRepo && !window.location.search.includes(sourceRepo)) {
 
 /**
  * 导出视频 (WebM)
+ * 注意：MediaRecorder 依赖浏览器合成器捕获画面，逐帧渲染之间必须让出主线程，
+ * 否则所有帧在一个任务内绘完，录制品可能只有最后一帧。
  */
 async function exportVideo() {
   if (!browserSupport.canExportVideo) {
-    showError("Video export not supported in this browser. Try Chrome, Edge, or Firefox.");
+    showError("当前浏览器不支持视频导出，请使用 Chrome、Edge 或 Firefox。");
     return;
   }
-  if (!state.geometry || !canvas) {
+  if (!state.geometry) {
     showError("没有可导出的树");
     return;
   }
@@ -236,7 +260,7 @@ async function exportVideo() {
 
     const duration = state.duration * 1000;
     const fps = 30;
-    const frameCount = (duration / 1000) * fps;
+    const frameCount = Math.max(1, Math.round((duration / 1000) * fps));
 
     // 创建离屏 canvas
     const offCanvas = document.createElement("canvas");
@@ -245,14 +269,36 @@ async function exportVideo() {
     const offCtx = offCanvas.getContext("2d");
     if (!offCtx) throw new Error("无法创建离屏 canvas");
 
-    // 获取录制流
+    // 获取录制流（兼容 codec 协商）
     const stream = offCanvas.captureStream(fps);
-    const mediaRecorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    let mimeType = "video/webm";
+    if (typeof MediaRecorder.isTypeSupported === "function") {
+      if (MediaRecorder.isTypeSupported("video/webm;codecs=vp9")) {
+        mimeType = "video/webm;codecs=vp9";
+      } else if (MediaRecorder.isTypeSupported("video/webm;codecs=vp8")) {
+        mimeType = "video/webm;codecs=vp8";
+      }
+    }
+    const mediaRecorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: 8_000_000,
+    });
     const chunks: Blob[] = [];
 
-    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+    mediaRecorder.onerror = () => {
+      showError("视频录制出错");
+      loadBtn.disabled = false;
+    };
     mediaRecorder.onstop = () => {
       const blob = new Blob(chunks, { type: "video/webm" });
+      if (blob.size === 0) {
+        showError("导出失败：录制品为空");
+        loadBtn.disabled = false;
+        return;
+      }
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -265,7 +311,7 @@ async function exportVideo() {
 
     mediaRecorder.start();
 
-    // 逐帧渲染
+    // 逐帧渲染，每帧之间让出主线程保证被捕获
     for (let frame = 0; frame < frameCount; frame++) {
       const t = frame / frameCount;
       renderFrame(offCtx, state.geometry, t, {
@@ -276,8 +322,11 @@ async function exportVideo() {
         sway: false, // 关闭风动以加快导出
       });
       showStatus(`导出中... ${Math.floor((frame / frameCount) * 100)}%`);
+      await new Promise((resolve) => setTimeout(resolve, 1000 / fps));
     }
 
+    // 保持一小段再停止，确保最后一帧被写入
+    await new Promise((resolve) => setTimeout(resolve, 300));
     mediaRecorder.stop();
   } catch (error: any) {
     showError(formatErrorForUI(error));
@@ -312,14 +361,24 @@ async function exportCard() {
     cardCtx.fillStyle = "#0a0e27";
     cardCtx.fillRect(0, 0, 1080, 1350);
 
-    // 顶部文字
+    // 中部：完整的树 (t=1)，关闭字幕层（卡片自带标题）
+    // 注意：必须先画树（其背景会覆盖整个绘制区），再画文字
+    renderFrame(cardCtx, state.geometry, 1.0, {
+      width: 1080,
+      height: 800,
+      dpr: 1,
+      theme: "dark",
+      sway: false,
+      overlay: false,
+    });
+
+    // 顶部文字（画在树之后，避免被树的背景覆盖）
     cardCtx.fillStyle = "#ffffff";
     cardCtx.font = "bold 32px Arial";
-    cardCtx.fillText(
-      `${state.model.source.owner}/${state.model.source.repo}`,
-      50,
-      60
-    );
+    const repoLabel = state.model?.source?.owner && state.model?.source?.repo
+      ? `${state.model.source.owner}/${state.model.source.repo}`
+      : "代码年轮";
+    cardCtx.fillText(repoLabel, 50, 60);
 
     cardCtx.font = "16px Arial";
     cardCtx.fillStyle = "#aaa";
@@ -327,15 +386,6 @@ async function exportCard() {
     const growthMsg =
       days < 90 ? "刚刚发芽" : days < 730 ? "正在拔节" : "已经成林";
     cardCtx.fillText(`已经生长 ${days} 天 · ${growthMsg}`, 50, 100);
-
-    // 中部：完整的树 (t=1)
-    renderFrame(cardCtx, state.geometry, 1.0, {
-      width: 1080,
-      height: 800,
-      dpr: 1,
-      theme: "dark",
-      sway: false,
-    });
 
     // 下部：统计数据 (2×3 格子)
     const stats = [
@@ -387,8 +437,13 @@ async function exportCard() {
 
 /**
  * 开始播放
+ * 先取消可能存在的上一个动画帧，避免重复启动导致倍速
  */
 function startPlayback() {
+  if (animationFrameId !== null) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = null;
+  }
   state.isPlaying = true;
   const startTime = Date.now();
   const startOffset = state.currentTime;
@@ -400,6 +455,7 @@ function startPlayback() {
     if (state.currentTime >= state.duration) {
       state.currentTime = state.duration;
       state.isPlaying = false;
+      animationFrameId = null;
       render();
       return;
     }
@@ -407,6 +463,8 @@ function startPlayback() {
     render();
     if (state.isPlaying) {
       animationFrameId = requestAnimationFrame(animate);
+    } else {
+      animationFrameId = null;
     }
   }
 
@@ -433,7 +491,7 @@ function render() {
 
   // 调整 canvas 尺寸，使用防守性编程
   let rect = canvasContainer.getBoundingClientRect();
-  
+
   // 如果容器尺寸为 0，使用备用值
   if (rect.width === 0 || rect.height === 0) {
     const containerStyle = window.getComputedStyle(canvasContainer);
@@ -447,16 +505,23 @@ function render() {
       x: 0,
       y: 0,
       toJSON: () => ({})
-    };
+    } as DOMRect;
   }
-  canvas.width = rect.width * window.devicePixelRatio;
-  canvas.height = rect.height * window.devicePixelRatio;
 
-  // 渲染
+  const dpr = window.devicePixelRatio || 1;
+  // 仅在尺寸变化时重设 backing store（重设会清空画布并触发重分配）
+  const targetW = Math.round(rect.width * dpr);
+  const targetH = Math.round(rect.height * dpr);
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
+  }
+
+  // 渲染（renderFrame 内部按 dpr 设置变换，传入 CSS 像素尺寸）
   renderFrame(ctx, state.geometry, t, {
     width: rect.width,
     height: rect.height,
-    dpr: window.devicePixelRatio,
+    dpr,
     theme: "dark",
     sway: true,
   });
@@ -470,10 +535,13 @@ function render() {
 
 /**
  * 显示画布容器
+ * 注意：样式表中 .canvas-container / .controls / .export-area 均为 display:none，
+ * 必须显式设为具体值（"block"/"flex"）。设为空字符串会回落到样式表的 none，画布将不可见。
  */
 function showCanvas() {
-  canvasContainer.style.display = "";
+  canvasContainer.style.display = "block";
   controls.style.display = "flex";
+  exportArea.style.display = "flex";
 }
 
 /**
@@ -529,6 +597,25 @@ function initFromURL() {
 window.addEventListener("resize", render);
 initPresets();
 initFromURL();
+
+// 调试钩子：暴露内部状态供端到端测试检查（只读快照）
+(window as any).__gittree = {
+  getState: () => ({
+    commits: state.model?.commits.length ?? 0,
+    samplingRate: state.model?.metadata?.samplingRate ?? 0,
+    lanes: state.model?.lanes.length ?? 0,
+    chapters: state.model?.chapters.map((c: any) => c.title) ?? [],
+    segments: state.geometry?.segments.length ?? 0,
+    leaves: state.geometry?.leaves.length ?? 0,
+    flowers: state.geometry?.flowers.length ?? 0,
+    firstCommitTime: state.model?.commits[0]?.time ?? null,
+    lastCommitTime: state.model?.commits[state.model?.commits.length - 1]?.time ?? null,
+    commitTimeAt: (idx: number) => state.model?.commits[idx]?.time ?? null,
+    timeMapHead: state.geometry?.timeMap.slice(0, 5) ?? [],
+    timeMapTail: state.geometry?.timeMap.slice(-5) ?? [],
+    source: state.model?.source ?? null,
+  }),
+};
 
 // 添加导出按钮事件（假设存在 HTML 中）
 const exportVideoBtn = document.querySelector("[data-action=export-video]") as HTMLButtonElement;

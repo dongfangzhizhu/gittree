@@ -1,5 +1,5 @@
 /**
- * 提交采样 + 父节点重连
+ * 提交采样 + 父节点重连（FR-DT-04/05）
  */
 
 import { Commit } from "./types";
@@ -11,8 +11,8 @@ export interface SamplingResult {
 
 /**
  * 采样算法：
- * - commits ≤ 500 时全留
- * - 否则强制保留首尾 + merge + tag，剩余等距抽样至 500
+ * - commits ≤ maxCount 时全留
+ * - 否则强制保留首尾 + merge + tag，剩余等距抽样至 maxCount
  */
 export function sampleCommits(
   commits: Commit[],
@@ -40,33 +40,48 @@ export function sampleCommits(
     forcedKeep.add(id);
   }
 
-  // 如果强制保留集已经 > maxCount，就在其中优先保留首尾和标签
+  // 强制保留集已超上限：保留首尾 + 标签，其余丢弃
   if (forcedKeep.size >= maxCount) {
-    const kept = Array.from(forcedKeep);
-    const result = commits.filter((c) => kept.includes(c.id));
+    const keepFirst = commits[0].id;
+    const keepLast = commits[commits.length - 1].id;
+    const priority = new Set<string>([keepFirst, keepLast, ...taggedCommitIds]);
+    const ordered = commits.filter((c) => forcedKeep.has(c.id));
+    const prioritized = ordered.filter((c) => priority.has(c.id));
+    const rest = ordered.filter((c) => !priority.has(c.id));
+    const result = [...prioritized, ...rest].slice(0, maxCount);
     return {
-      commits: result.slice(0, maxCount),
+      commits: result,
       samplingRate: maxCount / commits.length,
     };
   }
 
-  // 剩余名额用等距抽样
+  // 剩余名额用等距抽样（FR-DT-04：第 k 个取 round(k*(n-1)/(m-1))）
   const remaining = maxCount - forcedKeep.size;
   const otherCommits = commits.filter((c) => !forcedKeep.has(c.id));
-  const step = Math.max(1, Math.floor(otherCommits.length / remaining));
-
+  const n = otherCommits.length;
   const sampled: Commit[] = [];
-  for (let i = 0; i < otherCommits.length; i += step) {
-    sampled.push(otherCommits[i]);
+
+  if (remaining > 0 && n > 0) {
+    if (remaining === 1) {
+      sampled.push(otherCommits[Math.floor((n - 1) / 2)]);
+    } else {
+      for (let k = 0; k < remaining; k++) {
+        const idx = Math.round((k * (n - 1)) / (remaining - 1));
+        sampled.push(otherCommits[idx]);
+      }
+    }
   }
 
-  // 合并强制保留和采样后的提交，按时间排序
-  const allSampled = [...Array.from(forcedKeep).map((id) =>
-    commits.find((c) => c.id === id)
-  ), ...sampled].filter((c) => c !== undefined) as Commit[];
+  // 合并强制保留和采样后的提交，按时间排序（强制保留项绝不被丢弃）
+  const forcedCommits: Commit[] = [];
+  for (const id of forcedKeep) {
+    const c = commits.find((commit) => commit.id === id);
+    if (c) forcedCommits.push(c);
+  }
 
+  const allSampled = [...forcedCommits, ...sampled];
   const unique = Array.from(new Map(allSampled.map((c) => [c.id, c])).values());
-  unique.sort((a, b) => a.time - b.time);
+  unique.sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
 
   return {
     commits: unique.slice(0, maxCount),
@@ -75,41 +90,32 @@ export function sampleCommits(
 }
 
 /**
- * 采样后重连父节点
- * 每个采样提交的 parents 指向其最近的保留祖先
+ * 采样后重连父节点（FR-DT-05）
+ * 每个采样提交的 parents 指向其最近的保留祖先；
+ * 找不到保留祖先时，连接到时间上紧邻的更早保留提交；最早的提交为根。
  */
 export function reconnectParents(
   sampledCommits: Commit[],
   allCommits: Commit[]
 ): Commit[] {
-  const commitMap = new Map(allCommits.map((c) => [c.id, c]));
+  const parentMap = new Map(allCommits.map((c) => [c.id, c.parents]));
   const sampledIds = new Set(sampledCommits.map((c) => c.id));
+  const sampledIndex = new Map(sampledCommits.map((c, i) => [c.id, i]));
 
-  // 构建原始父子关系映射
-  const parentMap = new Map<string, string[]>();
-  for (const commit of allCommits) {
-    parentMap.set(commit.id, commit.parents);
-  }
-
-  // 对每个采样提交，查找其最近保留祖先
   const result = sampledCommits.map((commit) => {
     const newParents: string[] = [];
 
     for (const parentId of commit.parents) {
-      const ancestor = findNearestAncestor(
-        parentId,
-        sampledIds,
-        parentMap,
-        new Set()
-      );
-      if (ancestor) {
+      const ancestor = findNearestAncestor(parentId, sampledIds, parentMap, new Set());
+      if (ancestor && !newParents.includes(ancestor)) {
         newParents.push(ancestor);
       }
     }
 
-    // 如果没找到任何祖先，连接到时间上最接近的早期提交
-    if (newParents.length === 0 && commit !== sampledCommits[0]) {
-      for (let i = sampledCommits.indexOf(commit) - 1; i >= 0; i--) {
+    // 没找到保留祖先：连接到时间上最接近的更早保留提交
+    if (newParents.length === 0) {
+      const myIdx = sampledIndex.get(commit.id) ?? -1;
+      for (let i = myIdx - 1; i >= 0; i--) {
         if (sampledCommits[i].time < commit.time) {
           newParents.push(sampledCommits[i].id);
           break;
@@ -127,7 +133,7 @@ export function reconnectParents(
 }
 
 /**
- * BFS 查找最近的保留祖先
+ * BFS 查找最近的保留祖先（沿被删节点向上，保持原 parents 顺序）
  */
 function findNearestAncestor(
   commitId: string,

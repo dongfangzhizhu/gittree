@@ -7,3 +7,6 @@ dist/
 .vscode/
 *.swp
 .git-credentials
+
+.workbuddy/
+screenshots/

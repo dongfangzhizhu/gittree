@@ -7,15 +7,23 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest"
+    "test": "vitest run",
+    "test:e2e": "node scripts/e2e-check.mjs",
+    "test:export": "node scripts/export-test.mjs"
   },
-  "keywords": ["git", "visualization", "tree", "github"],
+  "keywords": [
+    "git",
+    "visualization",
+    "tree",
+    "github"
+  ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "playwright": "^1.64.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.4",
-    "vitest": "^1.0.0"
+    "vitest": "^3.2.7"
   }
 }
