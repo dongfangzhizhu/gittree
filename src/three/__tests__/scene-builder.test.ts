@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { buildScene } from "../scene-builder";
+import { buildScene, LEAVES_PER_CLUSTER, LEAVES_PER_TWIG, LEAVES_PER_FILL } from "../scene-builder";
 import { buildGrowthModel } from "../../core/growth-model";
 import { Commit, GrowthModel } from "../../core/types";
 
@@ -99,7 +99,7 @@ describe("buildScene", () => {
     const nonMerge = model.commits.filter((c) => !c.isMerge);
     // 叶簇：一个提交对应多片叶子（LEAVES_PER_CLUSTER），主叶 id 为 leaf-<idx>
     const commitLeaves = scene.leaves.filter((l) => /^leaf-\d+(-\d+)?$/.test(l.id));
-    expect(commitLeaves.length).toBe(nonMerge.length * 15);
+    expect(commitLeaves.length).toBe(nonMerge.length * LEAVES_PER_CLUSTER);
     expect(scene.leaves.length).toBeGreaterThanOrEqual(nonMerge.length);
     const leafedCommits = new Set(commitLeaves.map((l) => l.commitId));
     expect(leafedCommits.size).toBe(nonMerge.length);
@@ -138,11 +138,11 @@ describe("buildScene", () => {
     // 细分枝叶簇：id 前缀 leaf-twig-，数量比提交叶簇少
     const twigLeaves = scene.leaves.filter((l) => /^leaf-twig-\d+(-\d+)?$/.test(l.id));
     expect(twigLeaves.length).toBeGreaterThan(0);
-    expect(twigLeaves.length % 7).toBe(0);
+    expect(twigLeaves.length % LEAVES_PER_TWIG).toBe(0);
     // 填充叶簇：沿细分枝补的装饰叶
     const fillLeaves = scene.leaves.filter((l) => /^leaf-fill-\d+(-\d+)?$/.test(l.id));
     expect(fillLeaves.length).toBeGreaterThan(0);
-    expect(fillLeaves.length % 8).toBe(0);
+    expect(fillLeaves.length % LEAVES_PER_FILL).toBe(0);
     // 叶簇中心贴在细分枝梢头附近
     for (const leaf of twigLeaves) {
       expect(leaf.birth).toBeGreaterThan(0);

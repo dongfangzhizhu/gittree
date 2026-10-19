@@ -45,7 +45,7 @@ const FALL_DURATION = 0.06;
  * 叶/果的基础半径只有 0.3–1.6 单位，直接渲染不足 1px。
  * 放大到肉眼可见、可点击的尺寸（直径约 8–26 单位）。
  */
-const LEAF_SCALE = 13;
+const LEAF_SCALE = 17;
 const FRUIT_SCALE = 11;
 
 export type ViewName = "overview" | "side" | "top" | "root";
@@ -71,6 +71,8 @@ interface LeafGroup {
   items: SceneLeaf[];
   /** 每实例基础颜色 */
   baseColors: THREE.Color[];
+  /** 每实例基准朝向（叶面法线 + 叶柄方位），逐帧只叠一层风动 */
+  baseQuats: THREE.Quaternion[];
 }
 
 interface FruitGroup {
@@ -128,6 +130,9 @@ export class TreeRenderer {
   /** 程序化树皮纹理（全场景共用一份，切换场景不重建）：颜色 + 法线 */
   private barkTexture: THREE.Texture;
   private barkNormal: THREE.Texture;
+  /** 程序化叶片纹理（颜色 + 由叶脉明暗推导的法线），同样全场景共用 */
+  private leafTexture: THREE.Texture;
+  private leafNormal: THREE.Texture;
   private hoveredKey: string | null = null;
   private selectedKey: string | null = null;
 
@@ -161,6 +166,11 @@ export class TreeRenderer {
   private tmpEuler = new THREE.Euler();
   private tmpVec = new THREE.Vector3();
   private tmpScale = new THREE.Vector3();
+  /** 风动用的两个复用四元数 + 两个旋转轴（避免逐片新建对象） */
+  private flutterA = new THREE.Quaternion();
+  private flutterB = new THREE.Quaternion();
+  private readonly axisX = new THREE.Vector3(1, 0, 0);
+  private readonly axisZ = new THREE.Vector3(0, 0, 1);
   private upVector = new THREE.Vector3(0, 1, 0);
   /** 最近一次 updateTree 的时间点（判定节点是否可见） */
   private lastT = 0;
@@ -195,11 +205,17 @@ export class TreeRenderer {
     this.barkTexture = bark.color;
     this.barkNormal = bark.normal;
 
+    // 叶片纹理：同样程序化生成（叶脉 + 锯齿边缘 + 斑驳），
+    // 叶片几何只是薄卡片，靠 alpha 裁出真实轮廓，法线由叶脉明暗推导
+    const leaf = makeLeafTextures();
+    this.leafTexture = leaf.color;
+    this.leafNormal = leaf.normal;
+
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(BG_COLOR);
     this.scene.fog = new THREE.Fog(BG_COLOR, 1800, 4800);
 
-    this.camera = new THREE.PerspectiveCamera(48, 16 / 9, 5, 9000);
+    this.camera = new THREE.PerspectiveCamera(48, 16 / 9, 5, 24000);
     this.camera.position.set(1100, 800, 1300);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -337,9 +353,14 @@ export class TreeRenderer {
     this.forest = Array.isArray(forest) ? forest : [];
     if (!scene || scene.segments.length === 0) return;
 
+    // 雾距按场景尺度自适应：森林横向铺开几百上千单位后，固定的 near/far
+    // 会把远处整棵树糊成纯黑剪影（雾色就是背景色），看起来像「树没渲染出来」
+    const extent = Math.max(scene.height, scene.radius * 1.6, 600);
+    this.scene.fog = new THREE.Fog(BG_COLOR, extent * 2, extent * 5.2);
+
     this.buildSky();
     this.buildGround(scene.radius);
-    this.buildStars();
+    this.buildStars(Math.max(2600, extent * 2.4));
     this.buildFireflies(scene);
     this.buildBranches(scene);
     this.buildGrafts(scene);
@@ -453,8 +474,8 @@ export class TreeRenderer {
    * 渐变天空球：天顶深靛蓝 → 地平线暖紫，配一道极淡的「朝阳」辉光。
    * 关掉雾（半径 5000 已超出雾区），否则会被雾成一片纯色。
    */
-  private buildSky(): void {
-    const geo = new THREE.SphereGeometry(5000, 32, 20);
+  private buildSky(radius = 12000): void {
+    const geo = new THREE.SphereGeometry(radius, 32, 20);
     const mat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
@@ -506,7 +527,7 @@ export class TreeRenderer {
    */
   private buildGround(radius: number): void {
     const group = new THREE.Group();
-    const discR = Math.max(3000, radius * 6);
+    const discR = Math.min(Math.max(3000, radius * 6), 9000);
 
     const discGeo = new THREE.CircleGeometry(discR, 128);
     const discMat = new THREE.ShaderMaterial({
@@ -701,7 +722,7 @@ export class TreeRenderer {
   }
 
   /** 确定性星空（种子来自场景 seed） */
-  private buildStars(): void {
+  private buildStars(starBase = 2600): void {
     const scene = this.scene3d!;
     const count = 360;
     const positions = new Float32Array(count * 3);
@@ -713,7 +734,7 @@ export class TreeRenderer {
       const r2 = seedState / 0xffffffff;
       const theta = r1 * Math.PI * 2;
       const phi = Math.acos(1 - r2 * 0.85); // 偏上半球
-      const radius = 2600 + r1 * 600;
+      const radius = starBase + r1 * 600;
       positions[i * 3] = Math.sin(phi) * Math.cos(theta) * radius;
       positions[i * 3 + 1] = Math.abs(Math.cos(phi)) * radius + 200;
       positions[i * 3 + 2] = Math.sin(phi) * Math.sin(theta) * radius;
@@ -802,7 +823,17 @@ export class TreeRenderer {
     }
   }
 
-  /** 叶子：按形状分组的 InstancedMesh */
+  /**
+   * 叶子：按形状分组的 InstancedMesh。
+   *
+   * 参考 ez-tree 的做法——叶片本体只是一张薄卡片（12 个三角面），
+   * 真实轮廓（锯齿叶缘、叶尖、叶柄）由 alpha 裁切的程序化纹理给出，
+   * 叶脉起伏交给法线贴图。相比早先的 ExtrudeGeometry 三叶片：
+   * 三角面少一个数量级，近看却有叶脉与透光感，远看轮廓不再是「光滑水滴」。
+   *
+   * 朝向按每片叶自己的法线（scene 层给的 axis）建基——叶子朝各方向张开，
+   * 而不是统一躺在水平面上，冠层才有体积而不是「一层绿饼」。
+   */
   private buildLeaves(scene: ThreeScene): void {
     const byShape = new Map<string, SceneLeaf[]>();
     for (const leaf of scene.leaves) {
@@ -815,31 +846,44 @@ export class TreeRenderer {
     for (const [shape, items] of byShape) {
       const geo = leafGeometry(shape);
       if (!geo) continue;
-      // 叶形几何在 XY 平面（叶长沿 Y）；旋到水平面，再由实例矩阵做方位与俯仰
-      geo.rotateX(-Math.PI / 2);
       const mat = new THREE.MeshStandardMaterial({
-        roughness: 0.78,
-        metalness: 0,
+        map: this.leafTexture,
+        normalMap: this.leafNormal,
+        normalScale: new THREE.Vector2(0.75, 0.75),
+        // alphaTest 而非 transparent：不透明队列里裁边，天然按深度排序，
+        // 几万片叶子互相穿插也不会出现透明排序的糊块
+        alphaTest: 0.32,
         side: THREE.DoubleSide,
+        roughness: 0.74,
+        metalness: 0,
+        // 极淡的自发光：模拟真实叶片的透光（背光面不会糊成黑块），
+        // 也让树冠在深色夜空 + 泛光背景前仍读得出层次
+        emissive: 0x18220f,
+        emissiveIntensity: 0.85,
       });
       const mesh = new THREE.InstancedMesh(geo, mat, items.length);
       mesh.frustumCulled = false;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 
       const baseColors: THREE.Color[] = [];
+      const baseQuats: THREE.Quaternion[] = [];
       for (let i = 0; i < items.length; i++) {
         const leaf = items[i];
         const color =
           leaf.shape === "withered"
             ? new THREE.Color(WITHERED_COLOR)
             : new THREE.Color(LEAF_COLORS[leaf.colorIndex] || LEAF_COLORS[11]);
+        // 逐片做轻微色相/明度扰动：真实树冠里没有两片叶子是同一个色号，
+        // 否则整簇叶子会像一块贴纸。扰动幅度控制在「语义色不变」的范围内。
+        color.offsetHSL(leaf.axis[1] * 0.012, leaf.axis[2] * 0.05, leaf.axis[0] * 0.075);
         baseColors.push(color);
         mesh.setColorAt(i, color);
+        baseQuats.push(leafOrientation(leaf, i));
       }
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
 
       this.scene.add(mesh);
-      this.leafGroups.push({ mesh, items, baseColors });
+      this.leafGroups.push({ mesh, items, baseColors, baseQuats });
       this.pickMeshes.push(mesh);
     }
   }
@@ -987,13 +1031,15 @@ export class TreeRenderer {
           s *= 1 - f;
         }
 
-        // 风动：叶片按方位角铺开，只做小幅俯仰与偏摆，不再像螺旋桨那样自转
+        // 风动：在基准朝向上只叠加很小的俯仰与扭转，
+        // 叶子不会被吹成螺旋桨，但整片树冠会起细密的波纹
         s *= 1 + Math.sin(t * Math.PI * 2 * 2 + leaf.phase) * 0.05;
-        const yaw = leaf.phase * Math.PI * 2 + Math.sin(t * 1.7 + leaf.phase) * 0.14;
-        const tilt = 0.28 + leaf.axis[1] * 0.34 + Math.sin(t * 2.3 + leaf.phase * 2.1) * 0.08;
-        const roll = leaf.axis[0] * 0.6;
-        this.tmpEuler.set(tilt, yaw, roll, "YXZ");
-        this.tmpQuat.setFromEuler(this.tmpEuler);
+        const nod = Math.sin(t * 2.3 + leaf.phase * 2.1) * 0.16;
+        const twist = Math.sin(t * 1.7 + leaf.phase) * 0.12;
+        // 局部 X = 叶宽方向（点头），局部 Z = 叶面法线（自转）
+        this.flutterA.setFromAxisAngle(this.axisX, nod);
+        this.flutterB.setFromAxisAngle(this.axisZ, twist);
+        this.tmpQuat.copy(group.baseQuats[i]).multiply(this.flutterA).multiply(this.flutterB);
 
         if (s <= 0) {
           this.tmpScale.set(0, 0, 0);
@@ -1441,6 +1487,8 @@ export class TreeRenderer {
     this.clearScene();
     this.barkTexture.dispose();
     this.barkNormal.dispose();
+    this.leafTexture.dispose();
+    this.leafNormal.dispose();
     if (this.composer) {
       this.composer.dispose();
       this.composer = null;
@@ -1510,44 +1558,6 @@ function paintGeometry(geo: THREE.BufferGeometry, color: [number, number, number
 }
 
 /**
- * 真实叶片：用 Shape 贝塞尔曲线勾出叶形（基部渐窄 → 中部最宽 → 叶尖收拢），
- * 再挤出 5% 叶长的厚度并沿中脉上拱，避免「一片平板」的塑料感。
- * 几何以叶心为原点，叶长沿 Y，厚度沿 Z（渲染时旋到水平）。
- */
-function makeLeafGeometry(width: number, curl = 0.16): THREE.BufferGeometry {
-  const w = width * 0.5;
-  const shape = new THREE.Shape();
-  shape.moveTo(0, -0.5); // 叶柄端
-  shape.bezierCurveTo(w * 0.55, -0.34, w, -0.05, w * 0.92, 0.22);
-  shape.bezierCurveTo(w * 0.78, 0.42, w * 0.34, 0.5, 0, 0.54); // 叶尖
-  shape.bezierCurveTo(-w * 0.34, 0.5, -w * 0.78, 0.42, -w * 0.92, 0.22);
-  shape.bezierCurveTo(-w, -0.05, -w * 0.55, -0.34, 0, -0.5);
-
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: 0.04,
-    bevelEnabled: true,
-    bevelThickness: 0.015,
-    bevelSize: 0.02,
-    bevelSegments: 1,
-    steps: 1,
-    curveSegments: 5,
-  });
-  geo.center();
-
-  // 叶面上拱 + 叶尖略垂，叶缘比中脉低 → 有厚度的真叶观感
-  const pos = geo.getAttribute("position") as THREE.BufferAttribute;
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i);
-    const y = pos.getY(i);
-    const edge = Math.min(1, Math.abs(x) / Math.max(1e-4, w));
-    pos.setZ(i, pos.getZ(i) + curl * (1 - edge) * 0.12 - Math.abs(y) * 0.05);
-  }
-  pos.needsUpdate = true;
-  geo.computeVertexNormals();
-  return geo;
-}
-
-/**
  * 苹果：压扁的球体 + 顶部果脐凹陷 + 深色果柄。
  * 果身顶点色为白（由材质决定红/金/紫），果柄顶点色深褐。
  */
@@ -1581,46 +1591,100 @@ function makeAppleGeometry(scale = 1): THREE.BufferGeometry {
   return merged;
 }
 
+/**
+ * 叶片卡片（ez-tree 式）：只是一张细分平面，叶长沿 Y、叶面法线沿 Z。
+ *
+ * 真实轮廓交给 alpha 纹理，几何只负责「别是平板」：
+ * 沿叶宽方向微微上拱（中脉高于叶缘）、叶尖后卷下垂。
+ * 2×3 段 = 12 个三角面，比原先的挤出叶形少一个数量级，
+ * 几万片叶子同屏时省下的顶点/填充很可观。
+ */
+function makeLeafCard(width: number, height: number, curl = 0.2): THREE.BufferGeometry {
+  const geo = new THREE.PlaneGeometry(width, height, 2, 3);
+  const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const nx = pos.getX(i) / Math.max(1e-4, width * 0.5); // -1..1
+    const ny = pos.getY(i) / Math.max(1e-4, height * 0.5); // -1..1（1 = 叶尖）
+    // 中脉拱起、叶缘稍低
+    const cup = (1 - nx * nx) * curl * height * 0.18;
+    // 叶尖下垂 + 略向后卷，破掉纯平的剪影
+    const t = Math.max(0, ny);
+    const droop = -t * t * curl * height * 0.32;
+    pos.setZ(i, cup + droop);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/**
+ * 单片叶子的基准朝向：以 scene 层给的 axis 当叶面法线建正交基。
+ *
+ * - 法线做了「略微朝天」的偏置：真实叶片总是尽量迎着光，纯随机会有
+ *   大量叶子法线朝下，看起来像挂在枝上的纸片；
+ * - 叶长轴取世界 up 在叶面内的投影，再绕法线随机自转（叶柄朝向不一），
+ *   于是同一簇叶子呈放射状散开而不是并排的栅栏。
+ */
+function leafOrientation(leaf: SceneLeaf, i: number): THREE.Quaternion {
+  const n = new THREE.Vector3(leaf.axis[0], leaf.axis[1], leaf.axis[2]).normalize();
+  if (n.lengthSq() < 1e-6) n.set(0, 1, 0);
+  n.y = n.y * 0.75 + 0.42; // 偏置朝天
+  n.normalize();
+
+  const ref = Math.abs(n.y) > 0.94 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+  const across = new THREE.Vector3().crossVectors(ref, n).normalize();
+  const along = new THREE.Vector3().crossVectors(n, across).normalize();
+
+  const basis = new THREE.Matrix4().makeBasis(across, along, n);
+  const quat = new THREE.Quaternion().setFromRotationMatrix(basis);
+  // 绕叶面法线自转：相位来自叶子自身的确定性随机（axis + 序号），逐帧不变
+  const spin = (leaf.phase * 7.13 + i * 2.399) % (Math.PI * 2);
+  quat.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), spin));
+  return quat;
+}
+
+/**
+ * 叶片形状：宽度/长度比 + 卷曲度，纹理相同，靠比例区分提交类型。
+ * 几何仍在 XY 平面（叶长沿 Y、法线沿 Z），由实例四元数摆到树枝上。
+ */
 function leafGeometry(shape: string): THREE.BufferGeometry | null {
   switch (shape) {
     case "circle":
-      return makeLeafGeometry(0.78);
+      return makeLeafCard(0.9, 1.02, 0.24);
     case "pointed":
-      return makeLeafGeometry(0.52, 0.2);
+      return makeLeafCard(0.62, 1.08, 0.16);
     case "long":
-      return makeLeafGeometry(0.34, 0.22);
+      return makeLeafCard(0.46, 1.22, 0.14);
     case "small":
-      return makeLeafGeometry(0.6);
+      return makeLeafCard(0.76, 0.84, 0.22);
     case "tiny":
-      return makeLeafGeometry(0.66);
+      return makeLeafCard(0.64, 0.7, 0.22);
     case "withered": {
-      // 枯萎叶：更窄、更卷
-      const g = makeLeafGeometry(0.46, 0.46);
-      g.rotateZ(0.45);
+      // 枯萎叶：更窄更卷，叶尖前倾
+      const g = makeLeafCard(0.58, 1.0, 0.5);
+      g.rotateZ(0.3);
       return g;
     }
     case "triple": {
       // 三出复叶：三片小叶共柄
       const angles = [-0.55, 0, 0.55];
       const parts = angles.map((a) => {
-        const l = makeLeafGeometry(0.42, 0.18);
-        l.scale(0.7, 0.7, 0.7);
+        const l = makeLeafCard(0.44, 0.62, 0.2);
         l.rotateZ(a);
-        l.translate(Math.sin(a) * 0.2, 0.3, 0);
+        l.translate(Math.sin(a) * 0.18, 0.26, 0);
         return l;
       });
-      return mergeGeometries(parts) || makeLeafGeometry(0.5);
+      return mergeGeometries(parts) || makeLeafCard(0.6, 0.9, 0.2);
     }
     case "purple": {
-      // 五瓣小花（spec:/hook: 提交）
+      // 五瓣小花（spec:/hook: 提交）：五片小卡片围心排布
       const petals = Array.from({ length: 5 }, (_, i) => {
-        const p = makeLeafGeometry(0.5, 0.1);
-        p.scale(0.4, 0.4, 0.4);
+        const p = makeLeafCard(0.42, 0.46, 0.3);
+        p.translate(0, 0.17, 0);
         p.rotateZ((i / 5) * Math.PI * 2);
-        p.translate(Math.cos((i / 5) * Math.PI * 2) * 0.06, Math.sin((i / 5) * Math.PI * 2) * 0.06, 0);
         return p;
       });
-      return mergeGeometries(petals) || makeLeafGeometry(0.5);
+      return mergeGeometries(petals) || makeLeafCard(0.5, 0.5, 0.3);
     }
     default:
       return null;
@@ -1716,15 +1780,172 @@ function makeBarkTextures(): { color: THREE.Texture; normal: THREE.Texture } {
 }
 
 /**
+ * 程序化叶片纹理（256×256，含 alpha）。
+ *
+ * 一张贴图同时提供三样东西，这正是叶片「像真的」的关键：
+ * 1. **轮廓**：卵形叶身 + 锯齿叶缘 + 收尖的叶柄，靠 alphaTest 裁出来 ——
+ *    几何只是方块，剪影却是有齿的真叶子；
+ * 2. **叶脉**：中脉 + 8 对侧脉（二次贝塞尔），侧脉越靠叶尖越细；
+ * 3. **表面**：基部暗叶尖亮的渐变 + 斑驳色块，避免整片叶子同一色号。
+ *
+ * 底色刻意压在 0.85~1.0 的近白区间：实例色（提交类型配色）乘上去仍然准，
+ * 只把色相轻轻压暗一点，比纯色更像植物。
+ * 法线贴图由叶脉明暗推导，近看时叶脉有起伏。
+ */
+function makeLeafTextures(): { color: THREE.Texture; normal: THREE.Texture } {
+  const W = 512;
+  const H = 512;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d")!;
+  const cx = W * 0.5;
+  const yBase = H * 0.975;
+  const yTip = H * 0.015;
+  const yOf = (t: number) => yBase + (yTip - yBase) * t;
+
+  /**
+   * 叶缘半宽剖面（t: 0=叶柄端 → 1=叶尖）：
+   * sin 曲线给「中部最宽、两端收尖」的卵形，指数 0.62 让叶片前段饱满；
+   * 基部再乘一段线性收窄，接到叶柄上；中段叠锯齿，边缘才不是光滑曲线。
+   */
+  const halfWidth = (t: number) => {
+    const tt = Math.max(0, Math.min(1, t));
+    const body = Math.pow(Math.sin(Math.PI * Math.pow(tt, 0.9)), 0.62);
+    const taper = Math.min(1, tt / 0.16); // 基部收窄成叶柄
+    const serr = 1 + 0.07 * Math.sin(tt * 70) * Math.min(1, Math.max(0, (tt - 0.1) * 8)) * Math.min(1, Math.max(0, (0.97 - tt) * 10));
+    return body * taper * serr * W * 0.37;
+  };
+
+  const outline = () => {
+    ctx.beginPath();
+    const steps = 160;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = cx + halfWidth(t);
+      const y = yOf(t);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    for (let i = steps; i >= 0; i--) {
+      const t = i / steps;
+      ctx.lineTo(cx - halfWidth(t), yOf(t));
+    }
+    ctx.closePath();
+  };
+
+  // 叶柄：从叶基往下伸一小段细柄
+  ctx.beginPath();
+  ctx.moveTo(cx - 3, yBase - 2);
+  ctx.lineTo(cx + 3, yBase - 2);
+  ctx.lineTo(cx + 2.2, H);
+  ctx.lineTo(cx - 2.2, H);
+  ctx.closePath();
+  ctx.fillStyle = "#bfc4ac";
+  ctx.fill();
+
+  outline();
+  const grad = ctx.createLinearGradient(0, yTip, 0, yBase);
+  grad.addColorStop(0, "#fdfef8");
+  grad.addColorStop(0.5, "#f6f8ee");
+  grad.addColorStop(1, "#eaf0dd");
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // 后续细节都裁在叶身内
+  ctx.save();
+  outline();
+  ctx.clip();
+
+  // 中脉：基部粗、向叶尖收细
+  const mid = ctx.createLinearGradient(0, yBase, 0, yTip);
+  mid.addColorStop(0, "rgba(86,98,62,0.62)");
+  mid.addColorStop(0.55, "rgba(96,110,70,0.42)");
+  mid.addColorStop(1, "rgba(110,124,84,0.2)");
+  ctx.strokeStyle = mid;
+  ctx.lineCap = "round";
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(cx, yBase);
+  ctx.lineTo(cx, yTip + 4);
+  ctx.stroke();
+
+  // 侧脉：9 对，向上斜出并略向叶尖弯，越靠叶尖越细
+  for (let k = 0; k < 9; k++) {
+    const t0 = 0.08 + k * 0.093;
+    const t1 = t0 + 0.14;
+    const hw = halfWidth(t1) * 0.93;
+    ctx.strokeStyle = `rgba(88,104,62,${0.46 - k * 0.03})`;
+    ctx.lineWidth = Math.max(1.1, 3.2 - k * 0.22);
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(cx, yOf(t0));
+      ctx.quadraticCurveTo(cx + side * hw * 0.45, yOf(t0 + 0.02), cx + side * hw, yOf(t1));
+      ctx.stroke();
+    }
+  }
+
+  // 斑驳：先压几块明暗色块，再撒细颗粒，破坏「纯色填充」的塑料感
+  for (let i = 0; i < 34; i++) {
+    const t = 0.1 + Math.random() * 0.82;
+    const hw = halfWidth(t);
+    const x = cx + (Math.random() * 2 - 1) * hw * 0.9;
+    const y = yOf(t);
+    const r = 12 + Math.random() * 36;
+    const light = Math.random() < 0.55;
+    const g2 = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g2.addColorStop(0, light ? "rgba(255,255,250,0.22)" : "rgba(78,92,54,0.16)");
+    g2.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g2;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  for (let i = 0; i < 2600; i++) {
+    const t = Math.random();
+    const x = cx + (Math.random() * 2 - 1) * halfWidth(t);
+    const y = yOf(t);
+    ctx.fillStyle = Math.random() < 0.5 ? "rgba(64,78,44,0.045)" : "rgba(255,255,255,0.07)";
+    ctx.fillRect(x, y, 1.5, 1.5);
+  }
+  ctx.restore();
+
+  // 叶缘压一道细暗边：轮廓不靠 alpha 硬切，边缘更「有厚度」
+  outline();
+  ctx.strokeStyle = "rgba(70,82,48,0.34)";
+  ctx.lineWidth = 2.4;
+  ctx.stroke();
+
+  const color = new THREE.CanvasTexture(canvas);
+  color.colorSpace = THREE.SRGBColorSpace;
+  color.anisotropy = 8;
+  color.needsUpdate = true;
+
+  return { color, normal: makeNormalFromLuminance(canvas, 2.6, 0.94) };
+}
+
+/**
  * 由灰度图推导切线空间法线贴图：亮度当高度，中心差分求梯度。
  * 采样做环绕（不是 clamp），保证贴图可无缝平铺。
+ *
+ * `alphaFill`：透明像素（alpha<0.5）按该亮度参与计算。叶片是 alpha 裁切的，
+ * 若把透明区当 0 亮度，轮廓处会出现一圈假的「高亮描边」法线，
+ * 近看像叶子在发光；用叶身平均亮度填平后，法线只反映叶脉起伏。
  */
-function makeNormalFromLuminance(source: HTMLCanvasElement, strength: number): THREE.Texture {
+function makeNormalFromLuminance(
+  source: HTMLCanvasElement,
+  strength: number,
+  alphaFill?: number
+): THREE.Texture {
   const W = source.width;
   const H = source.height;
   const src = source.getContext("2d")!.getImageData(0, 0, W, H).data;
   const lum = new Float32Array(W * H);
   for (let i = 0; i < W * H; i++) {
+    if (alphaFill !== undefined && src[i * 4 + 3] < 128) {
+      lum[i] = alphaFill;
+      continue;
+    }
     lum[i] = (src[i * 4] * 0.299 + src[i * 4 + 1] * 0.587 + src[i * 4 + 2] * 0.114) / 255;
   }
   const at = (x: number, y: number) => lum[((y + H) % H) * W + ((x + W) % W)];

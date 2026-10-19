@@ -27,17 +27,21 @@ const BRANCH_DEPTH_FLATTEN_DEG = 9;
 /** 一级枝的伸展长度基准 = 树高 × 该系数（决定冠幅） */
 const LIMB_LEN_RATIO = 0.55;
 /** 每个提交长出的叶子数量（叶簇：单片叶太稀，看不出树冠） */
-const LEAVES_PER_CLUSTER = 15;
-/** 单棵树的叶片预算：提交多的仓库按比例稀释，避免森林模式几万片叶子拖垮帧率 */
-const LEAF_BUDGET_PER_TREE = 3000;
+export const LEAVES_PER_CLUSTER = 48;
+/**
+ * 单棵树的叶片预算：提交多的仓库按比例稀释，避免森林模式几万片叶子拖垮帧率。
+ * 叶片几何从挤出体改成 alpha 卡片后单片只要 12 个三角面（原先约 1/8），
+ * 所以预算可以比旧版翻几倍，换更密的树冠。
+ */
+const LEAF_BUDGET_PER_TREE = 12000;
 /** 细分枝梢头的叶簇数量（比提交叶簇小，只做填充） */
-const LEAVES_PER_TWIG = 7;
+export const LEAVES_PER_TWIG = 11;
 /** 沿细分枝补的装饰叶簇每团数量 */
-const LEAVES_PER_FILL = 8;
+export const LEAVES_PER_FILL = 12;
 /** 主干上最多长多少根细分枝 */
 const MAX_TRUNK_TWIGS = 14;
 /** 每条大枝上最多长多少根细分枝 */
-const MAX_LIMB_TWIGS = 2;
+const MAX_LIMB_TWIGS = 3;
 /**
  * 每棵树的细分枝总预算。
  * 每根细枝是一根独立管网格 = 一个 draw call，lane 很多的仓库
@@ -764,7 +768,9 @@ function emitLeafCluster(leaves: SceneLeaf[], spec: LeafClusterSpec): void {
     const r2 = seededRandom(`${spec.seedKey}:${k}`, 12);
     const r3 = seededRandom(`${spec.seedKey}:${k}`, 13);
     const r4 = seededRandom(`${spec.seedKey}:${k}`, 14);
-    const spread = 4 + r1 * 16;
+    // 叶团半径：收得比叶长略大一点，叶子能相互叠出「团」的体积；
+    // 早先 4~20 的撒法在远处会散成一层彩色灰，看不出树冠
+    const spread = 3 + r1 * 9;
     const theta = Math.acos(1 - r2 * 0.85); // 偏向上半球
     const phi = k * GOLDEN_ANGLE + r3 * Math.PI;
     const pos: Vec3 =
