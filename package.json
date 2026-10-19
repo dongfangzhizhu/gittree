@@ -15,7 +15,11 @@
     "test:interaction": "node scripts/interaction-test.mjs",
     "test:visual": "node scripts/visual-test.mjs",
     "perf:probe": "node scripts/perf-probe.mjs",
-    "shot:crown": "node scripts/crown-shot.mjs"
+    "shot:crown": "node scripts/crown-shot.mjs",
+    "demo:record": "node scripts/demo-record.mjs",
+    "demo:subtitle": "node scripts/demo-subtitle.mjs",
+    "demo:probe": "node scripts/demo-probe.mjs",
+    "doc:pdf": "node scripts/doc-to-pdf.mjs"
   },
   "keywords": [
     "git",
