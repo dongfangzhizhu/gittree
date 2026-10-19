@@ -77,7 +77,14 @@ npm run test:export # 导出功能测试（WebM/PNG 下载校验）
 npm run test:music  # 生长音乐测试（乐谱/手势解锁/音符推进/快捷键/MIDI 下载）
 npm run test:visual # 视觉专项：截图 + 帧率 + draw call + 画质降级
 npm run perf:probe  # 森林模式帧率/渲染开销探测
+npm run shot:crown  # 树冠特写截图（确认叶片/果实细节）
+npm run demo:probe  # 录制探针：验证浏览器能打开线上站点并采到 WebGL 画面
+npm run demo:record # 功能演示录制（1920×1080 WebM + 字幕时间轴 + ASS 字幕）
+npm run demo:subtitle # 由 cues.json 生成最终 ASS 字幕
+npm run doc:pdf     # 提交文档 HTML → A4 PDF
 ```
+
+> 演示与文档脚本的产物写到 `.demo-work/` 与 `submission/`（均已 gitignore）；ffmpeg/ffprobe 默认从 PATH 取，可用 `FFMPEG_DIR` 指定目录。
 
 使用：粘贴仓库地址（`owner/repo` 或完整 URL，可一次粘贴多个）→ 点「让它生长」；或点预置卡片多选后点「🌱 生长这片森林」。
 
