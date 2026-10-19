@@ -13,7 +13,12 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ThreeScene, SceneSegment, SceneLeaf, SceneFruit, SceneBranch } from "./scene-types";
+import type { QualityLevel } from "../core/perf-monitor";
 import { buildBranchGeometry, visibleRingCount } from "./branch-geometry";
 import type { ForestScene, ForestTreeMeta } from "./forest-builder";
 
@@ -24,9 +29,11 @@ const LEAF_COLORS = [
   "#F1948A", "#63A06E", "#9B59B6",
 ];
 const WITHERED_COLOR = "#8d6e63";
-const TRUNK_COLOR = 0x2f5d3f;
-const BRANCH_COLOR = 0x4a7c59;
-const GRAFT_COLOR = 0x7a9b6a;
+const TRUNK_COLOR = 0x4f7d5a;
+const BRANCH_COLOR = 0x6a9c73;
+/** 细分枝：更浅更亮，与主干分出层次（ez-tree 里细枝受光更多） */
+const TWIG_COLOR = 0x86b98f;
+const GRAFT_COLOR = 0x8fae7d;
 const GOLD = 0xffd700;
 const BG_COLOR = 0x0a0e27;
 
@@ -38,7 +45,7 @@ const FALL_DURATION = 0.06;
  * 叶/果的基础半径只有 0.3–1.6 单位，直接渲染不足 1px。
  * 放大到肉眼可见、可点击的尺寸（直径约 8–26 单位）。
  */
-const LEAF_SCALE = 11;
+const LEAF_SCALE = 13;
 const FRUIT_SCALE = 11;
 
 export type ViewName = "overview" | "side" | "top" | "root";
@@ -86,8 +93,13 @@ export interface NodeHitFruit {
 
 export type NodeHit = NodeHitLeaf | NodeHitFruit;
 
+/** 画质档位：供低帧率自动降级使用（定义在 core/perf-monitor，此处复用） */
+export type { QualityLevel };
+
 export interface TreeRendererOptions {
   dpr?: number;
+  /** 初始画质档位（默认 high：泛光 + 高 DPR） */
+  quality?: QualityLevel;
 }
 
 export class TreeRenderer {
@@ -110,9 +122,28 @@ export class TreeRenderer {
 
   private ground: THREE.Group | null = null;
   private stars: THREE.Points | null = null;
+  private sky: THREE.Mesh | null = null;
+  private fireflies: THREE.Points | null = null;
   private selectionMarker: THREE.Mesh | null = null;
+  /** 程序化树皮纹理（全场景共用一份，切换场景不重建）：颜色 + 法线 */
+  private barkTexture: THREE.Texture;
+  private barkNormal: THREE.Texture;
   private hoveredKey: string | null = null;
   private selectedKey: string | null = null;
+
+  /** 后期处理链：RenderPass → UnrealBloomPass → OutputPass（ACES 色调映射） */
+  private composer: EffectComposer | null = null;
+  /** 泛光开关（低帧率降级时关闭，直接走普通渲染） */
+  private bloomEnabled = true;
+  /** DPR 上限（降级时压低） */
+  private dprCap = 2;
+  /** 当前画质档位 */
+  private quality: QualityLevel = "high";
+  /**
+   * 叶片抽稀步长（ez-tree 的 leafStride）：1 = 全画，2 = 隔一片画一片。
+   * 森林模式叶片可达上万片，低端机靠这个把顶点/填充开销砍半。
+   */
+  private leafStride = 1;
 
   /** 相机过渡动画状态 */
   private camAnim: {
@@ -146,9 +177,23 @@ export class TreeRenderer {
       antialias: true,
       // 保留绘制缓冲：toDataURL（PNG 导出）与 readPixels（测试采样）依赖它
       preserveDrawingBuffer: true,
+      // 优先独显：泛光 + 阴影对 GPU 有压力，尽量拿高性能适配器
+      powerPreference: "high-performance",
     });
-    this.renderer.setPixelRatio(options.dpr ?? window.devicePixelRatio ?? 1);
+    this.quality = options.quality ?? "high";
+    this.applyQualityProfile(this.quality);
+    this.renderer.setPixelRatio(this.effectivePixelRatio(options.dpr ?? window.devicePixelRatio ?? 1));
     this.renderer.setClearColor(BG_COLOR, 1);
+    // ACES 电影级色调映射：让高光（果实自发光、萤火虫）过曝得更自然，
+    // 与 OutputPass 配合后 bloom 不会把画面推成一片死白
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.3;
+
+    // 树皮纹理：程序化生成，无需外部贴图资源（ez-tree 改为外置贴图，
+    // 但本项目要零依赖离线运行，所以用 canvas 现场画一套纤维+裂纹，并由灰度推导法线）
+    const bark = makeBarkTextures();
+    this.barkTexture = bark.color;
+    this.barkNormal = bark.normal;
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(BG_COLOR);
@@ -176,17 +221,112 @@ export class TreeRenderer {
     this.setupLights();
   }
 
+  /** 画质档位 → 泛光/DPR 上限/叶片抽稀 */
+  private applyQualityProfile(level: QualityLevel): void {
+    switch (level) {
+      case "high":
+        this.bloomEnabled = true;
+        this.dprCap = 2;
+        this.leafStride = 1;
+        break;
+      case "medium":
+        this.bloomEnabled = true;
+        this.dprCap = 1.25;
+        this.leafStride = 1;
+        break;
+      case "low":
+      default:
+        this.bloomEnabled = false;
+        this.dprCap = 1;
+        this.leafStride = 2;
+        break;
+    }
+  }
+
+  /** 实际生效的像素比（不超过档位上限） */
+  private effectivePixelRatio(requested: number): number {
+    return Math.max(0.5, Math.min(requested, this.dprCap));
+  }
+
+  /**
+   * 切换画质档位（性能自适应降级用）。
+   * 关闭泛光时直接走普通渲染路径，省掉一整条全屏后处理链。
+   */
+  setQuality(level: QualityLevel): void {
+    this.quality = level;
+    this.applyQualityProfile(level);
+    const raw = window.devicePixelRatio ?? 1;
+    this.renderer.setPixelRatio(this.effectivePixelRatio(raw));
+    if (this.composer) this.composer.setPixelRatio(this.effectivePixelRatio(raw));
+    if (this.fireflies) {
+      (this.fireflies.material as THREE.ShaderMaterial).uniforms.uPixelRatio.value =
+        this.effectivePixelRatio(raw);
+    }
+    const canvas = this.renderer.domElement;
+    const w = canvas.clientWidth || canvas.width;
+    const h = canvas.clientHeight || canvas.height;
+    if (w > 0 && h > 0) this.resize(w, h);
+    // 抽稀步长影响叶片可见性：暂停状态下也要立刻重绘，否则切档「没反应」
+    this.updateTree(this.lastT);
+  }
+
+  /** 当前画质档位 */
+  getQuality(): QualityLevel {
+    return this.quality;
+  }
+
+  /** 泛光是否开启 */
+  isBloomEnabled(): boolean {
+    return this.bloomEnabled;
+  }
+
+  /** 单独开关泛光（UI 上可做成「光效」开关） */
+  setBloomEnabled(on: boolean): void {
+    this.bloomEnabled = on;
+  }
+
+  /** 懒初始化后期处理链（要等拿到真实画幅，避免按 16/9 估算分配缓冲） */
+  private ensureComposer(): EffectComposer | null {
+    if (!this.bloomEnabled) return null;
+    if (this.composer) return this.composer;
+    const size = this.renderer.getSize(new THREE.Vector2());
+    if (size.x <= 0 || size.y <= 0) return null;
+    const composer = new EffectComposer(this.renderer);
+    composer.setPixelRatio(this.renderer.getPixelRatio());
+    composer.setSize(size.x, size.y);
+    composer.addPass(new RenderPass(this.scene, this.camera));
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(size.x, size.y),
+      0.62, // strength：只给自发光果实/萤火虫加柔光，不让整棵树发毛
+      0.72, // radius：光晕扩散范围
+      0.68, // threshold：只有明显亮于环境的像素才 bloom
+    );
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+    this.composer = composer;
+    return composer;
+  }
+
   private setupLights(): void {
-    const hemi = new THREE.HemisphereLight(0x9fb4ff, 0x0a0e27, 0.62);
+    // 环境光兜底：ACES 色调映射会把暗部压得很死，没有 ambient 时背光面纯黑
+    const ambient = new THREE.AmbientLight(0x93a8cc, 0.45);
+    this.scene.add(ambient);
+
+    const hemi = new THREE.HemisphereLight(0xbcd0ff, 0x16223a, 0.8);
     this.scene.add(hemi);
 
-    const sun = new THREE.DirectionalLight(0xfff2d8, 1.0);
+    const sun = new THREE.DirectionalLight(0xfff2d8, 1.25);
     sun.position.set(700, 1400, 500);
     this.scene.add(sun);
 
-    const rim = new THREE.DirectionalLight(0x4ecdc4, 0.4);
+    const rim = new THREE.DirectionalLight(0x4ecdc4, 0.55);
     rim.position.set(-600, 300, -500);
     this.scene.add(rim);
+
+    // 树冠附近的暖色点光：让果实与叶片有「逆光通透感」
+    const warm = new THREE.PointLight(0xffc98a, 0.7, 2600, 1.6);
+    warm.position.set(0, 520, 0);
+    this.scene.add(warm);
   }
 
   /** 编译场景描述 → three 对象图 */
@@ -197,8 +337,10 @@ export class TreeRenderer {
     this.forest = Array.isArray(forest) ? forest : [];
     if (!scene || scene.segments.length === 0) return;
 
+    this.buildSky();
     this.buildGround(scene.radius);
     this.buildStars();
+    this.buildFireflies(scene);
     this.buildBranches(scene);
     this.buildGrafts(scene);
     this.buildLeaves(scene);
@@ -285,6 +427,18 @@ export class TreeRenderer {
       (this.stars.material as THREE.Material).dispose();
       this.stars = null;
     }
+    if (this.sky) {
+      this.scene.remove(this.sky);
+      this.sky.geometry.dispose();
+      (this.sky.material as THREE.Material).dispose();
+      this.sky = null;
+    }
+    if (this.fireflies) {
+      this.scene.remove(this.fireflies);
+      this.fireflies.geometry.dispose();
+      (this.fireflies.material as THREE.Material).dispose();
+      this.fireflies = null;
+    }
     if (this.selectionMarker) {
       this.scene.remove(this.selectionMarker);
       this.selectionMarker.geometry.dispose();
@@ -295,18 +449,154 @@ export class TreeRenderer {
     this.selectedKey = null;
   }
 
-  /** 年轮地纹 + 地面光晕（呼应「代码年轮」意象） */
+  /**
+   * 渐变天空球：天顶深靛蓝 → 地平线暖紫，配一道极淡的「朝阳」辉光。
+   * 关掉雾（半径 5000 已超出雾区），否则会被雾成一片纯色。
+   */
+  private buildSky(): void {
+    const geo = new THREE.SphereGeometry(5000, 32, 20);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      uniforms: {
+        uTop: { value: new THREE.Color(0x070a1e) },
+        uMid: { value: new THREE.Color(0x1b2b5e) },
+        uBottom: { value: new THREE.Color(0x3a2a5c) },
+        uSunDir: { value: new THREE.Vector3(700, 1400, 500).normalize() },
+        uSunColor: { value: new THREE.Color(0xffb27a) },
+      },
+      vertexShader: /* glsl */ `
+        varying vec3 vDir;
+        void main() {
+          vDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform vec3 uTop;
+        uniform vec3 uMid;
+        uniform vec3 uBottom;
+        uniform vec3 uSunDir;
+        uniform vec3 uSunColor;
+        varying vec3 vDir;
+
+        void main() {
+          float h = clamp(vDir.y, -1.0, 1.0);
+          // 天顶 → 地平线 → 地面以下
+          vec3 col = mix(uMid, uTop, smoothstep(0.05, 0.75, h));
+          col = mix(col, uBottom, smoothstep(0.05, -0.35, h));
+          // 太阳方向的一抹暖光（贴近地平线更明显）
+          float sun = max(dot(normalize(vDir), normalize(uSunDir)), 0.0);
+          float halo = pow(sun, 6.0) * 0.34 + pow(sun, 64.0) * 0.5;
+          col += uSunColor * halo * smoothstep(0.35, -0.15, h);
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+    this.sky = new THREE.Mesh(geo, mat);
+    this.sky.frustumCulled = false;
+    this.scene.add(this.sky);
+  }
+
+  /**
+   * 年轮地纹 + 地面光晕（呼应「代码年轮」意象）。
+   * 地面是一块 ShaderMaterial 圆盘：静态同心年轮 + 随生长进度外扩的能量脉冲带
+   * + 有机噪点，边缘淡出融入雾色，看不见硬边。
+   */
   private buildGround(radius: number): void {
     const group = new THREE.Group();
+    const discR = Math.max(3000, radius * 6);
 
-    const glowGeo = new THREE.CircleGeometry(Math.max(600, radius * 1.8), 64);
-    const glowTex = makeRadialTexture();
-    const glowMat = new THREE.MeshBasicMaterial({
-      map: glowTex,
+    const discGeo = new THREE.CircleGeometry(discR, 128);
+    const discMat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
+      side: THREE.DoubleSide,
+      uniforms: {
+        uProgress: { value: 0 },
+        uRadius: { value: discR },
+        uTime: { value: 0 },
+        uTeal: { value: new THREE.Color(0x4ecdc4) },
+        uViolet: { value: new THREE.Color(0x8e6fd0) },
+        uBg: { value: new THREE.Color(BG_COLOR) },
+      },
+      vertexShader: /* glsl */ `
+        varying vec2 vPos;
+        void main() {
+          vPos = position.xy;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uProgress;
+        uniform float uRadius;
+        uniform float uTime;
+        uniform vec3 uTeal;
+        uniform vec3 uViolet;
+        uniform vec3 uBg;
+        varying vec2 vPos;
+
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+        }
+        float noise(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          vec2 u = f * f * (3.0 - 2.0 * f);
+          return mix(
+            mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x),
+            mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
+            u.y
+          );
+        }
+
+        void main() {
+          float r = length(vPos);
+          float rn = r / uRadius;
+
+          // 有机斑驳：两层噪点叠加，避免「纯数学圆环」的塑料感
+          float mottle = noise(vPos * 0.02) * 0.6 + noise(vPos * 0.09) * 0.4;
+
+          // 静态年轮（间距不均 + 噪点扰动 → 更像真实木材切面）
+          float rings = 0.5 + 0.5 * sin(r * 0.11 + mottle * 1.6);
+          rings *= 0.5 + 0.5 * sin(r * 0.031 + mottle * 0.7);
+
+          // 生长脉冲：一条高斯亮带从树根向外扩（进度驱动）
+          float front = uProgress * uRadius * 1.05;
+          float band = exp(-pow((r - front) * 0.0032, 2.0));
+          // 已长过的区域保留淡淡的余晖
+          float afterglow = smoothstep(front + 900.0, front - 200.0, r) * 0.16;
+
+          float edge = 1.0 - smoothstep(0.45, 1.0, rn);
+          float alpha = edge * (0.075 + 0.045 * rings + 0.28 * band + afterglow);
+
+          vec3 col = mix(uTeal, uViolet, clamp(rn * 1.3, 0.0, 1.0));
+          col += uTeal * band * 0.55;
+          // 边缘过渡到背景色，消除接缝
+          col = mix(uBg, col, edge);
+
+          gl_FragColor = vec4(col, alpha);
+        }
+      `,
     });
-    const glow = new THREE.Mesh(glowGeo, glowMat);
+    const disc = new THREE.Mesh(discGeo, discMat);
+    disc.rotation.x = -Math.PI / 2;
+    disc.position.y = -6;
+    disc.renderOrder = -1;
+    group.add(disc);
+
+    // 树根处的一团柔光（径向贴图），给「起点」一个视觉焦点
+    const glowTex = makeRadialTexture();
+    const glow = new THREE.Mesh(
+      new THREE.CircleGeometry(Math.max(600, radius * 1.8), 64),
+      new THREE.MeshBasicMaterial({
+        map: glowTex,
+        transparent: true,
+        depthWrite: false,
+        fog: false,
+      })
+    );
     glow.rotation.x = -Math.PI / 2;
     glow.position.y = -2;
     group.add(glow);
@@ -329,7 +619,85 @@ export class TreeRenderer {
     }
 
     this.ground = group;
+    this.ground.userData.discMat = discMat;
     this.scene.add(group);
+  }
+
+  /**
+   * 萤火虫：树冠周围缓慢游荡的加法混合光点。
+   * 位置由 t 驱动（与生长进度绑定）→ 视频导出仍是确定性的，
+   * 同时「生长」与「流萤」共用一条时间轴，看上去像树在吸引它们。
+   */
+  private buildFireflies(scene: ThreeScene): void {
+    const count = 170;
+    const positions = new Float32Array(count * 3);
+    const seeds = new Float32Array(count);
+    let state = hashString(scene.seed + ":fireflies");
+    const rand = () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return state / 0xffffffff;
+    };
+    for (let i = 0; i < count; i++) {
+      const a = rand() * Math.PI * 2;
+      const r = 140 + rand() * Math.max(260, scene.radius * 0.85);
+      positions[i * 3] = Math.cos(a) * r;
+      positions[i * 3 + 1] = 40 + rand() * scene.height * 0.92;
+      positions[i * 3 + 2] = Math.sin(a) * r;
+      seeds[i] = rand();
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+
+    const dpr = this.renderer.getPixelRatio();
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uPixelRatio: { value: dpr },
+        uWarm: { value: new THREE.Color(0xffe6a8) },
+        uCool: { value: new THREE.Color(0x9ff5ea) },
+      },
+      vertexShader: /* glsl */ `
+        attribute float aSeed;
+        uniform float uTime;
+        uniform float uPixelRatio;
+        varying float vTwinkle;
+        varying float vSeed;
+        void main() {
+          float s = aSeed * 6.2831853;
+          vec3 p = position;
+          p.x += sin(uTime * 0.55 + s) * 30.0;
+          p.y += sin(uTime * 0.85 + s * 1.7) * 16.0;
+          p.z += cos(uTime * 0.48 + s * 1.3) * 30.0;
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          gl_Position = projectionMatrix * mv;
+          vTwinkle = 0.45 + 0.55 * sin(uTime * 2.3 + s * 3.1);
+          vSeed = aSeed;
+          gl_PointSize = (7.0 + 13.0 * aSeed) * uPixelRatio * (420.0 / max(1.0, -mv.z));
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform vec3 uWarm;
+        uniform vec3 uCool;
+        varying float vTwinkle;
+        varying float vSeed;
+        void main() {
+          vec2 d = gl_PointCoord - vec2(0.5);
+          float r = length(d);
+          if (r > 0.5) discard;
+          float a = pow(smoothstep(0.5, 0.0, r), 2.2);
+          vec3 col = mix(uWarm, uCool, vSeed);
+          gl_FragColor = vec4(col, a * vTwinkle * 0.9);
+        }
+      `,
+    });
+
+    this.fireflies = new THREE.Points(geo, mat);
+    this.fireflies.frustumCulled = false;
+    this.scene.add(this.fireflies);
   }
 
   /** 确定性星空（种子来自场景 seed） */
@@ -366,17 +734,23 @@ export class TreeRenderer {
 
   /**
    * 枝干：每条 lane 一根连续管状网格（CatmullRom 平滑 + 平行传输标架 + 连续锥度），
-   * 彻底消除「多段圆柱拼接」的接缝与折痕
+   * 彻底消除「多段圆柱拼接」的接缝与折痕。
+   * 树皮用程序化生成的纤维纹理（UV 已按半径归一，粗细枝密度一致）。
    */
   private buildBranches(scene: ThreeScene): void {
     for (const branch of scene.branches) {
       const built = buildBranchGeometry(branch);
       if (built.ringCount === 0) continue;
 
-      const color = branch.kind === "trunk" ? TRUNK_COLOR : BRANCH_COLOR;
+      const color =
+        branch.kind === "trunk" ? TRUNK_COLOR : branch.kind === "twig" ? TWIG_COLOR : BRANCH_COLOR;
       const mat = new THREE.MeshStandardMaterial({
         color,
-        roughness: 0.92,
+        map: this.barkTexture,
+        normalMap: this.barkNormal,
+        normalScale: new THREE.Vector2(0.9, 0.9),
+        roughnessMap: this.barkTexture,
+        roughness: branch.kind === "twig" ? 0.88 : 0.95,
         metalness: 0,
       });
       const mesh = new THREE.Mesh(built.geometry, mat);
@@ -414,7 +788,13 @@ export class TreeRenderer {
       const rings = 14;
       const geo = new THREE.TubeGeometry(curve, rings, 1.5, 6, false);
       geo.setDrawRange(0, 0);
-      const mat = new THREE.MeshStandardMaterial({ color: GRAFT_COLOR, roughness: 0.95 });
+      const mat = new THREE.MeshStandardMaterial({
+        color: GRAFT_COLOR,
+        map: this.barkTexture,
+        normalMap: this.barkNormal,
+        roughness: 0.95,
+        metalness: 0,
+      });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.frustumCulled = false;
       this.scene.add(mesh);
@@ -574,9 +954,18 @@ export class TreeRenderer {
       const mesh = group.mesh;
       for (let i = 0; i < group.items.length; i++) {
         const leaf = group.items[i];
+        if (this.leafStride > 1 && i % this.leafStride !== 0) {
+          // 低画质抽稀：整数量级地省掉一半叶片的顶点与填充
+          this.tmpScale.set(0, 0, 0);
+          this.tmpVec.set(leaf.pos[0], leaf.pos[1], leaf.pos[2]);
+          this.tmpMatrix.compose(this.tmpVec, this.tmpQuat.identity(), this.tmpScale);
+          mesh.setMatrixAt(i, this.tmpMatrix);
+          continue;
+        }
         if (t < leaf.birth) {
           this.tmpScale.set(0, 0, 0);
-          this.tmpMatrix.compose(new THREE.Vector3(...leaf.pos), this.tmpQuat.identity(), this.tmpScale);
+          this.tmpVec.set(leaf.pos[0], leaf.pos[1], leaf.pos[2]);
+          this.tmpMatrix.compose(this.tmpVec, this.tmpQuat.identity(), this.tmpScale);
           mesh.setMatrixAt(i, this.tmpMatrix);
           continue;
         }
@@ -588,7 +977,8 @@ export class TreeRenderer {
           const f = (t - leaf.fallAt) / FALL_DURATION;
           if (f >= 1) {
             this.tmpScale.set(0, 0, 0);
-            this.tmpMatrix.compose(new THREE.Vector3(x, y, z), this.tmpQuat.identity(), this.tmpScale);
+            this.tmpVec.set(x, y, z);
+            this.tmpMatrix.compose(this.tmpVec, this.tmpQuat.identity(), this.tmpScale);
             mesh.setMatrixAt(i, this.tmpMatrix);
             continue;
           }
@@ -657,6 +1047,23 @@ export class TreeRenderer {
         this.selectionMarker.visible = false;
       }
     }
+
+    this.updateAmbience(t);
+  }
+
+  /**
+   * 驱动氛围元素：地面年轮脉冲随生长进度外扩，萤火虫随时间游荡。
+   * 都用 t（动画时间）而不是墙钟时间，保证同一 t 画面完全一致（视频导出可复现）。
+   */
+  private updateAmbience(t: number): void {
+    const discMat = this.ground?.userData.discMat as THREE.ShaderMaterial | undefined;
+    if (discMat) {
+      discMat.uniforms.uProgress.value = t;
+      discMat.uniforms.uTime.value = t * 20;
+    }
+    if (this.fireflies) {
+      (this.fireflies.material as THREE.ShaderMaterial).uniforms.uTime.value = t * 20;
+    }
   }
 
   /** 渲染一帧（含相机阻尼与过渡动画） */
@@ -669,9 +1076,26 @@ export class TreeRenderer {
       if (k >= 1) this.camAnim = null;
     }
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    this.drawFrame();
     // 通知外部：三维画面已更新（HTML 名牌据此跟随投影位置）
     this.onAfterRender?.();
+  }
+
+  /**
+   * 真正出一帧：开启泛光时走 RenderPass → UnrealBloomPass → OutputPass 后处理链，
+   * 否则直接渲染（省掉整条全屏链，低端机降级用）。
+   */
+  private drawFrame(): void {
+    // 手动重置统计：走 composer 时每个 pass 都会 render 一次，
+    // 自动重置会让 info 只剩最后一个全屏 quad 的数据（1 call / 1 triangle）
+    this.renderer.info.autoReset = false;
+    this.renderer.info.reset();
+    const composer = this.bloomEnabled ? this.ensureComposer() : null;
+    if (composer) {
+      composer.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
   }
 
   /** 视角预设 */
@@ -819,7 +1243,9 @@ export class TreeRenderer {
     };
 
     for (const group of this.leafGroups) {
-      for (const leaf of group.items) {
+      for (let i = 0; i < group.items.length; i++) {
+        const leaf = group.items[i];
+        if (this.leafStride > 1 && i % this.leafStride !== 0) continue; // 抽稀掉的不可点
         if (this.lastT < leaf.birth) continue; // 尚未长出
         if (leaf.fallAt !== undefined && this.lastT > leaf.fallAt + FALL_DURATION) continue; // 已落尽
         consider("leaf", leaf, 1);
@@ -859,28 +1285,26 @@ export class TreeRenderer {
     };
   }
 
-  /** 枚举前 n 个叶子 key（测试用） */
+  /**
+   * 枚举 n 个叶子 key（测试用）。
+   * 按全量均匀取样而不是「取前 n 个」——森林里第一棵树的叶子可能就上万片，
+   * 取前 n 个会永远只落在第 0 棵树上。
+   */
   sampleLeafKeys(n = 5): string[] {
-    const out: string[] = [];
+    const all: string[] = [];
     for (const group of this.leafGroups) {
-      for (const item of group.items) {
-        out.push(item.id);
-        if (out.length >= n) return out;
-      }
+      for (const item of group.items) all.push(item.id);
     }
-    return out;
+    return evenSample(all, n);
   }
 
-  /** 枚举前 n 个果实 key（测试用） */
+  /** 枚举 n 个果实 key（测试用，取样规则同上） */
   sampleFruitKeys(n = 5): string[] {
-    const out: string[] = [];
+    const all: string[] = [];
     for (const group of this.fruitGroups) {
-      for (const item of group.items) {
-        out.push(item.id);
-        if (out.length >= n) return out;
-      }
+      for (const item of group.items) all.push(item.id);
     }
-    return out;
+    return evenSample(all, n);
   }
 
   /** hover 高亮：增亮对应实例颜色 */
@@ -912,17 +1336,32 @@ export class TreeRenderer {
     if (this.selectionMarker) this.selectionMarker.visible = key !== null;
   }
 
-  /** 画布像素统计（端到端测试用，读 WebGL 绘制缓冲） */
-  sampleCanvas(): { w: number; h: number; nonBgRatio: number; distinctColors: number } {
-    this.renderer.render(this.scene, this.camera);
+  /**
+   * 画布像素统计（端到端测试用，读 WebGL 绘制缓冲）。
+   * - nonBgRatio / greenRatio：全量扫描的粗指标
+   * - sig：40×23 降采样签名（每格 3 个分量），供测试比较两帧画面差异——
+   *   有了渐变天空球后「非背景占比」恒接近 100%，只能靠逐格比对判断树长了多少
+   */
+  sampleCanvas(): {
+    w: number;
+    h: number;
+    nonBgRatio: number;
+    distinctColors: number;
+    greenRatio: number;
+    sig: number[];
+  } {
+    this.drawFrame();
     const canvas = this.renderer.domElement;
     const gl = this.renderer.getContext();
     const w = canvas.width;
     const h = canvas.height;
-    if (!w || !h) return { w, h, nonBgRatio: 0, distinctColors: 0 };
+    if (!w || !h) {
+      return { w, h, nonBgRatio: 0, distinctColors: 0, greenRatio: 0, sig: [] };
+    }
     const pixels = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     let nonBg = 0;
+    let green = 0;
     let total = 0;
     const colors = new Set<string>();
     for (let y = 0; y < h; y += 4) {
@@ -934,15 +1373,39 @@ export class TreeRenderer {
         total++;
         // 背景色 #0a0e27 附近
         if (!(r < 45 && g < 55 && b < 80)) nonBg++;
+        // 绿色主导：树皮/叶片/年轮地纹（天空是蓝紫，b 占优，不会误判）
+        if (g > r + 10 && g > b + 10 && g > 40) green++;
         colors.add(`${r >> 4},${g >> 4},${b >> 4}`);
       }
     }
-    return { w, h, nonBgRatio: nonBg / Math.max(1, total), distinctColors: colors.size };
+
+    // 降采样签名：固定 40×23 网格，与画布实际像素尺寸无关
+    const GW = 40;
+    const GH = 23;
+    const sig: number[] = [];
+    for (let gy = 0; gy < GH; gy++) {
+      for (let gx = 0; gx < GW; gx++) {
+        const x = Math.min(w - 1, Math.floor(((gx + 0.5) / GW) * w));
+        // WebGL 的 readPixels 原点在左下角，转成「从上到下」的直觉顺序
+        const y = Math.min(h - 1, Math.floor((1 - (gy + 0.5) / GH) * h));
+        const i = (y * w + x) * 4;
+        sig.push(pixels[i], pixels[i + 1], pixels[i + 2]);
+      }
+    }
+
+    return {
+      w,
+      h,
+      nonBgRatio: nonBg / Math.max(1, total),
+      distinctColors: colors.size,
+      greenRatio: green / Math.max(1, total),
+      sig,
+    };
   }
 
   /** PNG 截图数据（纪念卡导出用） */
   snapshotDataURL(): string {
-    this.renderer.render(this.scene, this.camera);
+    this.drawFrame();
     return this.renderer.domElement.toDataURL("image/png");
   }
 
@@ -953,10 +1416,19 @@ export class TreeRenderer {
 
   /** 尺寸变化 */
   resize(width: number, height: number, dpr?: number): void {
-    if (dpr) this.renderer.setPixelRatio(dpr);
+    const raw = dpr ?? window.devicePixelRatio ?? 1;
+    this.renderer.setPixelRatio(this.effectivePixelRatio(raw));
     this.renderer.setSize(width, height, false);
     this.camera.aspect = width / Math.max(1, height);
     this.camera.updateProjectionMatrix();
+    if (this.fireflies) {
+      (this.fireflies.material as THREE.ShaderMaterial).uniforms.uPixelRatio.value =
+        this.renderer.getPixelRatio();
+    }
+    if (this.composer) {
+      this.composer.setPixelRatio(this.renderer.getPixelRatio());
+      this.composer.setSize(width, height);
+    }
     // 首帧拿到真实画幅后重新取景，避免默认 16/9 估算导致裁切
     if (this.needsFrame) {
       this.needsFrame = false;
@@ -964,14 +1436,36 @@ export class TreeRenderer {
     }
   }
 
+  /** 释放 GPU 资源（热更新/卸载时调用） */
+  dispose(): void {
+    this.clearScene();
+    this.barkTexture.dispose();
+    this.barkNormal.dispose();
+    if (this.composer) {
+      this.composer.dispose();
+      this.composer = null;
+    }
+    this.renderer.dispose();
+  }
+
   /** 场景统计（调试/测试钩子） */
-  stats(): { segments: number; branches: number; leaves: number; fruits: number; trees: number } {
+  stats(): {
+    segments: number;
+    branches: number;
+    leaves: number;
+    fruits: number;
+    trees: number;
+    quality: QualityLevel;
+    bloom: boolean;
+  } {
     return {
       segments: this.scene3d?.segments.length ?? 0,
       branches: this.scene3d?.branches.length ?? 0,
       leaves: this.scene3d?.leaves.length ?? 0,
       fruits: this.scene3d?.fruits.length ?? 0,
       trees: this.forest.length,
+      quality: this.quality,
+      bloom: this.bloomEnabled,
     };
   }
 
@@ -1141,17 +1635,150 @@ function makeRadialTexture(): THREE.Texture {
   canvas.height = size;
   const ctx = canvas.getContext("2d")!;
   const grad = ctx.createRadialGradient(size / 2, size / 2, 8, size / 2, size / 2, size / 2);
-  grad.addColorStop(0, "rgba(78, 205, 196, 0.22)");
-  grad.addColorStop(0.55, "rgba(78, 205, 196, 0.07)");
+  grad.addColorStop(0, "rgba(78, 205, 196, 0.14)");
+  grad.addColorStop(0.55, "rgba(78, 205, 196, 0.045)");
   grad.addColorStop(1, "rgba(78, 205, 196, 0)");
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, size, size);
-  const tex = new THREE.CanvasTexture(canvas);
+  return new THREE.CanvasTexture(canvas);
+}
+
+/**
+ * 程序化树皮纹理（canvas 现场画，零外部资源）：
+ * - 纵向纤维：大量 1px 宽的深浅竖条，模拟树皮的纹理走向
+ * - 横向皮孔/裂纹：随机短横线，打断纯纵向的呆板感
+ * - 噪点：细颗粒，避免「塑料平滑」
+ * 同时当 roughnessMap 用（亮处更粗糙），所以明暗也影响光泽。
+ * 返回颜色贴图 + 由亮度梯度推导的法线贴图（让树皮真的有起伏）。
+ */
+function makeBarkTextures(): { color: THREE.Texture; normal: THREE.Texture } {
+  const W = 256;
+  const H = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d")!;
+
+  // 底色：中性偏亮灰（最终颜色由材质 color 决定，贴图只提供明暗/粗糙变化）
+  ctx.fillStyle = "#ddd7cb";
+  ctx.fillRect(0, 0, W, H);
+
+  // 纵向纤维
+  for (let i = 0; i < 1400; i++) {
+    const x = Math.random() * W;
+    const w = 0.6 + Math.random() * 2.2;
+    const dark = Math.random();
+    const alpha = 0.08 + Math.random() * 0.3;
+    ctx.fillStyle =
+      dark > 0.55 ? `rgba(40,32,24,${alpha})` : `rgba(240,235,224,${alpha * 0.8})`;
+    // 纤维略带倾斜，沿高度方向有轻微漂移
+    const drift = Math.sin((x / W) * Math.PI * 3) * 6;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x + drift, H);
+    ctx.lineTo(x + drift + w, H);
+    ctx.lineTo(x + w, 0);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // 皮孔 / 横向裂纹
+  for (let i = 0; i < 260; i++) {
+    const x = Math.random() * W;
+    const y = Math.random() * H;
+    const len = 3 + Math.random() * 22;
+    const alpha = 0.08 + Math.random() * 0.26;
+    ctx.strokeStyle = `rgba(38,30,22,${alpha})`;
+    ctx.lineWidth = 0.6 + Math.random() * 1.4;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + len, y + (Math.random() - 0.5) * 3);
+    ctx.stroke();
+  }
+
+  // 细噪点
+  const img = ctx.getImageData(0, 0, W, H);
+  const data = img.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const n = (Math.random() - 0.5) * 18;
+    data[i] = Math.max(0, Math.min(255, data[i] + n));
+    data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + n));
+    data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + n));
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const color = new THREE.CanvasTexture(canvas);
+  color.wrapS = THREE.RepeatWrapping;
+  color.wrapT = THREE.RepeatWrapping;
+  color.colorSpace = THREE.SRGBColorSpace;
+
+  return { color, normal: makeNormalFromLuminance(canvas, 3.4) };
+}
+
+/**
+ * 由灰度图推导切线空间法线贴图：亮度当高度，中心差分求梯度。
+ * 采样做环绕（不是 clamp），保证贴图可无缝平铺。
+ */
+function makeNormalFromLuminance(source: HTMLCanvasElement, strength: number): THREE.Texture {
+  const W = source.width;
+  const H = source.height;
+  const src = source.getContext("2d")!.getImageData(0, 0, W, H).data;
+  const lum = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    lum[i] = (src[i * 4] * 0.299 + src[i * 4 + 1] * 0.587 + src[i * 4 + 2] * 0.114) / 255;
+  }
+  const at = (x: number, y: number) => lum[((y + H) % H) * W + ((x + W) % W)];
+
+  const out = ctx2d(W, H);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const dx = (at(x + 1, y) - at(x - 1, y)) * strength;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * strength;
+      let nx = -dx;
+      let ny = -dy;
+      let nz = 1;
+      const len = Math.hypot(nx, ny, nz) || 1;
+      nx /= len;
+      ny /= len;
+      nz /= len;
+      const i = (y * W + x) * 4;
+      out.data[i] = (nx * 0.5 + 0.5) * 255;
+      out.data[i + 1] = (ny * 0.5 + 0.5) * 255;
+      out.data[i + 2] = (nz * 0.5 + 0.5) * 255;
+    }
+  }
+  const tex = new THREE.CanvasTexture(canvasFrom(out, W, H));
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
   return tex;
+}
+
+function ctx2d(w: number, h: number): ImageData {
+  return new ImageData(w, h);
+}
+
+function canvasFrom(img: ImageData, w: number, h: number): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  c.getContext("2d")!.putImageData(img, 0, 0);
+  return c;
 }
 
 function easeInOutCubic(k: number): number {
   return k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+}
+
+/** 从数组里均匀取 n 个（n >= 长度时全给） */
+function evenSample<T>(all: T[], n: number): T[] {
+  if (n <= 0) return [];
+  if (all.length <= n) return all.slice();
+  const step = all.length / n;
+  const out: T[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push(all[Math.min(all.length - 1, Math.floor(i * step))]);
+  }
+  return out;
 }
 
 function hashString(s: string): number {

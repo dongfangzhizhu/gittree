@@ -41,6 +41,22 @@ async function canvasStats(page) {
   return page.evaluate(() => window.__gittree?.sampleCanvas() ?? null);
 }
 
+/** 两张签名的差异比例：任一通道差值 > tol 即算「这一格变了」 */
+function sigDiffRatio(a, b, tol = 16) {
+  if (!a?.sig?.length || !b?.sig?.length || a.sig.length !== b.sig.length) return 0;
+  let changed = 0;
+  const cells = a.sig.length / 3;
+  for (let i = 0; i < a.sig.length; i += 3) {
+    const d = Math.max(
+      Math.abs(a.sig[i] - b.sig[i]),
+      Math.abs(a.sig[i + 1] - b.sig[i + 1]),
+      Math.abs(a.sig[i + 2] - b.sig[i + 2])
+    );
+    if (d > tol) changed++;
+  }
+  return changed / cells;
+}
+
 const browser = await chromium.launch({
   channel: "chrome",
   args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -86,8 +102,10 @@ const statsB = await canvasStats(page);
 report("动画随时间推进", frameA !== frameB, `timeDisplay: ${frameA} → ${frameB}`);
 report(
   "画布非空白（树已绘制）",
-  statsA && statsA.nonBgRatio > 0.0015,
-  statsA ? `非背景像素占比 ${(statsA.nonBgRatio * 100).toFixed(2)}%, 颜色数 ${statsA.distinctColors}` : "no canvas"
+  statsA && statsA.nonBgRatio > 0.5 && statsA.distinctColors > 20,
+  statsA
+    ? `非背景像素占比 ${(statsA.nonBgRatio * 100).toFixed(2)}%, 颜色数 ${statsA.distinctColors}, 绿色占比 ${(statsA.greenRatio * 100).toFixed(2)}%`
+    : "no canvas"
 );
 report(
   "动画帧之间有像素变化",
@@ -119,7 +137,15 @@ await page.waitForTimeout(1200);
 const tResumed = await page.evaluate(() => document.getElementById("timeDisplay")?.textContent);
 report("恢复播放后时间推进", tResumed !== tPaused2, `${tPaused2} → ${tResumed}`);
 
-// 5. 拖动时间轴到末尾
+// 5. 先回到开头记录「刚发芽」状态，再拖到末尾对比树冠覆盖率
+await page.evaluate(() => {
+  const slider = document.getElementById("timeSlider");
+  slider.value = "0";
+  slider.dispatchEvent(new Event("input", { bubbles: true }));
+});
+await page.waitForTimeout(500);
+const statsStart = await canvasStats(page);
+
 await page.evaluate(() => {
   const slider = document.getElementById("timeSlider");
   slider.value = "100";
@@ -127,10 +153,13 @@ await page.evaluate(() => {
 });
 await page.waitForTimeout(600);
 const statsEnd = await canvasStats(page);
+// 渐变天空球铺满全屏后「非背景占比」恒接近 100%、叶色又是五颜六色，
+// 改用 40×23 降采样签名的逐格差异来衡量「画面里多了多少东西」
+const grownDiff = sigDiffRatio(statsStart, statsEnd);
 report(
-  "拖到末尾后树完整（像素更多）",
-  statsEnd && statsEnd.nonBgRatio >= statsA.nonBgRatio,
-  `t=0 时 ${(statsA.nonBgRatio * 100).toFixed(2)}% → t=1 时 ${(statsEnd.nonBgRatio * 100).toFixed(2)}%`
+  "拖到末尾后树长满画面（画面显著不同）",
+  grownDiff > 0.08,
+  `t=0 → t=1 有 ${(grownDiff * 100).toFixed(1)}% 的采样格发生变化`
 );
 await page.screenshot({ path: resolve(OUT_DIR, "03-full-tree.png") });
 
@@ -164,8 +193,10 @@ if (TEST_REPO) {
     const repoStats = await canvasStats(page);
     report(
       "真实仓库画布非空白",
-      repoStats && repoStats.nonBgRatio > 0.0015,
-      repoStats ? `非背景像素占比 ${(repoStats.nonBgRatio * 100).toFixed(2)}%` : "no canvas"
+      repoStats && repoStats.nonBgRatio > 0.5 && repoStats.distinctColors > 20,
+      repoStats
+        ? `非背景像素占比 ${(repoStats.nonBgRatio * 100).toFixed(2)}%, 颜色数 ${repoStats.distinctColors}, 绿色占比 ${(repoStats.greenRatio * 100).toFixed(2)}%`
+        : "no canvas"
     );
     await page.screenshot({ path: resolve(OUT_DIR, "04-real-repo.png") });
     // URL 分享参数

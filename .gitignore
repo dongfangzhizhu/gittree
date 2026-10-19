@@ -10,3 +10,7 @@ dist/
 
 .workbuddy/
 screenshots*/
+
+# 本地演示/生成产物
+.demo-work/
+submission/

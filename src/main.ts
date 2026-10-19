@@ -25,6 +25,8 @@ import {
   formatCacheAge,
 } from "./core/cache";
 import { Commit, GrowthModel, RawHistory } from "./core/types";
+import { GrowthMusic } from "./audio/growth-music";
+import { PerfMonitor, qualityLabel, QualityLevel } from "./core/perf-monitor";
 
 interface AppState {
   isLoading: boolean;
@@ -102,6 +104,25 @@ const cacheStatus = document.getElementById("cacheStatus") as HTMLElement;
 const autoRotateToggle = document.getElementById("autoRotate") as HTMLInputElement | null;
 
 const infoPanel = createInfoPanel(document.getElementById("infoPanel") as HTMLElement);
+
+/**
+ * 生长音乐引擎（Web Audio 手搓 MIDI 合成器）
+ * 上下文懒创建：只有用户点过音乐按钮才真正出声（浏览器自动播放策略）
+ */
+const growthMusic = new GrowthMusic({ volume: 0.5 });
+
+/**
+ * 帧率监测 → 自动画质降级。
+ * 连续多个统计窗口掉到 60fps 的 78%（≈47fps）以下时，依次关高 DPR / 关泛光，
+ * 保证老机器与集显也能流畅看完生长动画；用户可在顶栏手动切回高画质。
+ */
+const perfMonitor = new PerfMonitor({
+  onLevelChange: (level, reason) => {
+    renderer?.setQuality(level);
+    syncQualityButton();
+    showStatus(`⚡ 已自动切换到「${qualityLabel(level)}」（${reason}）`);
+  },
+});
 
 let renderer: TreeRenderer | null = null;
 let animationFrameId: number | null = null;
@@ -288,6 +309,8 @@ function showForest(entries: ForestEntry[]): boolean {
   r.setScene(scene);
   pausePlayback();
   state.currentTime = 0;
+  // 新场景重新统计帧率：不继承上一个仓库的坏帧，也不重复降档
+  perfMonitor.reset();
   infoPanel.show(null);
   mountTreeLabels(scene.trees);
   syncFocusLabels();
@@ -299,6 +322,8 @@ function showForest(entries: ForestEntry[]): boolean {
       : `已生成 ${entries.length} 棵树的森林 · 共 ${totalCommits} 个提交`;
   showStatus(statusText);
   showCanvas();
+  // 换乐谱：焦点树的历史 → 一段五声音阶的「生长音乐」
+  growthMusic.setModel(state.model, state.duration);
   startPlayback();
   render();
   refreshCacheStatus(currentRepoFull);
@@ -321,6 +346,8 @@ function setFocusTree(index: number) {
   state.focusIndex = index;
   state.model = entry.model;
   currentRepoFull = entry.repo;
+  // 焦点树的音乐也跟着换：点哪棵树，就听哪棵树的历史
+  growthMusic.setModel(entry.model, state.duration);
   syncFocusLabels();
   if (!changed) return;
   render();
@@ -419,10 +446,18 @@ function startPlayback() {
   }
   state.isPlaying = true;
   syncPlayButton();
-  const startTime = performance.now();
-  const startOffset = state.currentTime;
+  let startTime = performance.now();
+  let startOffset = state.currentTime;
+  let lastFrameAt = startTime;
 
   function animate(now: number) {
+    // 切后台再回来：rAF 会暂停，回来时 now 跳变一大段。
+    // 若直接按 elapsed 推进，动画会「瞬移」到结尾，这里检测到停顿就重新对表。
+    if (now - lastFrameAt > 400) {
+      startTime = now;
+      startOffset = state.currentTime;
+    }
+    lastFrameAt = now;
     const elapsed = (now - startTime) / 1000;
     state.currentTime = startOffset + elapsed * state.speed;
 
@@ -430,6 +465,7 @@ function startPlayback() {
       state.currentTime = state.duration;
       state.isPlaying = false;
       animationFrameId = null;
+      perfMonitor.reset();
       syncPlayButton();
       render();
       return;
@@ -489,6 +525,12 @@ function render() {
   // 三维更新与绘制
   r.updateTree(t);
   r.render();
+
+  // 音乐：把这一帧「新长出来」的提交变成音符（指针推进，不会重播）
+  growthMusic.update(t);
+
+  // 帧率采样：连续掉帧就自动降画质（切后台的大间隔帧已被 PerfMonitor 剔除）
+  perfMonitor.sample(performance.now());
 
   // HUD：章节标题 + 日期 + 进度
   updateHud(t);
@@ -935,6 +977,7 @@ speedSelect.addEventListener("change", (e) => {
 });
 durationSelect.addEventListener("change", (e) => {
   state.duration = parseFloat((e.target as HTMLSelectElement).value);
+  growthMusic.setDuration(state.duration);
 });
 timeSlider.addEventListener("input", (e) => {
   state.currentTime = (parseFloat((e.target as HTMLInputElement).value) / 100) * state.duration;
@@ -967,6 +1010,20 @@ document.addEventListener("keydown", (e) => {
     state.currentTime = state.duration;
     pausePlayback();
     render();
+  }
+  // M：音乐开关（与顶栏按钮同一逻辑）
+  if (e.code === "KeyM" && !e.metaKey && !e.ctrlKey) {
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")) return;
+    e.preventDefault();
+    void toggleMusic();
+  }
+  // P：画质档位循环（与顶栏按钮同一逻辑）
+  if (e.code === "KeyP" && !e.metaKey && !e.ctrlKey) {
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")) return;
+    e.preventDefault();
+    cycleQuality();
   }
 });
 
@@ -1194,10 +1251,97 @@ const exportCardBtn = document.querySelector("[data-action=export-card]") as HTM
 if (exportVideoBtn) exportVideoBtn.addEventListener("click", exportVideo);
 if (exportCardBtn) exportCardBtn.addEventListener("click", exportCard);
 
+// ==================== 生长音乐 ====================
+
+const musicBtn = document.getElementById("musicBtn") as HTMLButtonElement | null;
+const midiBtn = document.getElementById("midiBtn") as HTMLButtonElement | null;
+
+/** 同步音乐按钮外观（有声 / 静音） */
+function syncMusicButton() {
+  if (!musicBtn) return;
+  const on = growthMusic.isRunning();
+  musicBtn.textContent = on ? "🎵 音乐开" : "🔇 音乐关";
+  musicBtn.classList.toggle("is-on", on);
+  musicBtn.title = on
+    ? "生长音乐播放中：点此静音（快捷键 M）"
+    : "点此开启生长音乐：每个提交对应一个音（快捷键 M）";
+}
+
+/**
+ * 音乐开关：必须在用户手势里创建/恢复 AudioContext，
+ * 否则浏览器自动播放策略会把它挂起（表现为「点了没声音」）
+ */
+async function toggleMusic() {
+  if (growthMusic.isMuted()) {
+    growthMusic.setMuted(false);
+    await growthMusic.resume(); // 恢复被挂起的上下文
+    if (!state.model) {
+      showError("还没有可播放的项目：先加载一个仓库或点一张卡片");
+    } else {
+      growthMusic.setModel(state.model, state.duration);
+      growthMusic.startDrone();
+      showStatus(`🎵 生长音乐已开启 · ${growthMusic.stats().total} 个音符，与生长进度同步`);
+    }
+  } else {
+    growthMusic.setMuted(true);
+    growthMusic.stopDrone();
+    showStatus("🔇 生长音乐已静音");
+  }
+  syncMusicButton();
+}
+
+if (musicBtn) musicBtn.addEventListener("click", () => void toggleMusic());
+if (midiBtn) {
+  midiBtn.addEventListener("click", () => {
+    if (!state.model) {
+      showError("还没有可导出的项目：先加载一个仓库或点一张卡片");
+      return;
+    }
+    growthMusic.exportMidi();
+    showStatus("🎹 已导出这段生长音乐的 MIDI 文件（可拖进任意 DAW / 打谱软件）");
+  });
+}
+
+// ==================== 画质档位 ====================
+
+const qualityBtn = document.getElementById("qualityBtn") as HTMLButtonElement | null;
+const QUALITY_ORDER: QualityLevel[] = ["high", "medium", "low"];
+const QUALITY_ICON: Record<QualityLevel, string> = {
+  high: "✨",
+  medium: "⚖",
+  low: "🍃",
+};
+
+/** 同步画质按钮外观（档位 → 图标/文案/配色，配色由 data-level 驱动 CSS） */
+function syncQualityButton() {
+  if (!qualityBtn) return;
+  const level = perfMonitor.getLevel();
+  qualityBtn.textContent = `${QUALITY_ICON[level]} ${qualityLabel(level)}`;
+  qualityBtn.dataset.level = level;
+  qualityBtn.title =
+    level === "high"
+      ? "当前高画质（泛光 + 高分辨率）。掉帧时会自动降档，点此手动切换"
+      : `当前「${qualityLabel(level)}」。点此切换到更高画质`;
+}
+
+/** 手动循环切换画质：高 → 均衡 → 流畅 → 高 */
+function cycleQuality() {
+  const idx = QUALITY_ORDER.indexOf(perfMonitor.getLevel());
+  const next = QUALITY_ORDER[(idx + 1) % QUALITY_ORDER.length];
+  perfMonitor.setLevel(next, "手动切换");
+  renderer?.setQuality(next);
+  syncQualityButton();
+  showStatus(`🎨 画质已切换到「${qualityLabel(next)}」`);
+}
+
+if (qualityBtn) qualityBtn.addEventListener("click", cycleQuality);
+
 // 初始化
 window.addEventListener("resize", render);
 initPresets();
 initFromURL();
+syncMusicButton();
+syncQualityButton();
 
 // 调试钩子：暴露内部状态供端到端测试检查（只读快照）
 (window as any).__gittree = {
@@ -1248,6 +1392,31 @@ initFromURL();
   /** 枚举叶子/果实 key（测试用） */
   sampleLeafKeys: (n?: number) => renderer?.sampleLeafKeys(n) ?? [],
   sampleFruitKeys: (n?: number) => renderer?.sampleFruitKeys(n) ?? [],
+  /** 生长音乐状态（测试/调试） */
+  music: () => ({ ...growthMusic.stats(), muted: growthMusic.isMuted(), running: growthMusic.isRunning() }),
+  /** 切换音乐（需在用户手势里调用，测试用 click 即可） */
+  toggleMusic: () => void toggleMusic(),
+  /** 画质/帧率状态（测试/调试） */
+  perf: () => perfMonitor.stats(),
+  /** WebGL 渲染开销（draw call / 三角面 / 显存对象数） */
+  drawInfo: () => {
+    const info = renderer?.renderer.info;
+    if (!info) return null;
+    return {
+      calls: info.render.calls,
+      triangles: info.render.triangles,
+      geometries: info.memory.geometries,
+      textures: info.memory.textures,
+      quality: renderer?.getQuality() ?? "high",
+      bloom: renderer?.isBloomEnabled() ?? false,
+    };
+  },
+  /** 手动设置画质档位（测试用） */
+  setQuality: (level: QualityLevel) => {
+    perfMonitor.setLevel(level, "调试钩子");
+    renderer?.setQuality(level);
+    syncQualityButton();
+  },
   /** 每棵树的树冠锚点（世界坐标） */
   treeAnchors: () => renderer?.treeAnchors() ?? [],
   /** 每棵树的树冠锚点 → 页面坐标（测试名牌位置） */

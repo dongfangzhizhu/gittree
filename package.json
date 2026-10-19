@@ -10,8 +10,12 @@
     "test": "vitest run",
     "test:e2e": "node scripts/e2e-check.mjs",
     "test:forest": "node scripts/forest-test.mjs",
+    "test:music": "node scripts/music-test.mjs",
     "test:export": "node scripts/export-test.mjs",
-    "test:interaction": "node scripts/interaction-test.mjs"
+    "test:interaction": "node scripts/interaction-test.mjs",
+    "test:visual": "node scripts/visual-test.mjs",
+    "perf:probe": "node scripts/perf-probe.mjs",
+    "shot:crown": "node scripts/crown-shot.mjs"
   },
   "keywords": [
     "git",

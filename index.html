@@ -844,6 +844,53 @@
       box-shadow: 0 8px 20px rgba(230, 126, 34, 0.3);
     }
 
+    /* 音乐开关：与导出按钮同色系，开启时改青色高亮 */
+    .export-area #midiBtn {
+      background: linear-gradient(135deg, #b39ddb, #7e57c2);
+      color: #1d0f38;
+    }
+
+    .export-area #midiBtn:hover:not(:disabled) {
+      box-shadow: 0 8px 20px rgba(126, 87, 194, 0.35);
+    }
+
+    .export-area .music-btn {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--dim);
+      border: 1px solid var(--border);
+      min-width: 96px;
+    }
+
+    .export-area .music-btn.is-on {
+      background: linear-gradient(135deg, #7ef0e6, var(--accent));
+      color: #04231f;
+      border-color: transparent;
+      animation: music-pulse 2.4s ease-in-out infinite;
+    }
+
+    @keyframes music-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(78, 205, 196, 0.45); }
+      50% { box-shadow: 0 0 0 6px rgba(78, 205, 196, 0); }
+    }
+
+    /* 画质档位开关：高=金 / 均衡=青 / 流畅=灰 */
+    .export-area .quality-btn {
+      background: linear-gradient(135deg, #ffe29a, #f5b942);
+      color: #3a2a00;
+      min-width: 92px;
+    }
+
+    .export-area .quality-btn[data-level="medium"] {
+      background: linear-gradient(135deg, #9be8ff, #45b7d1);
+      color: #05252e;
+    }
+
+    .export-area .quality-btn[data-level="low"] {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--dim);
+      border: 1px solid var(--border);
+    }
+
     /* 播放/暂停合并开关：固定宽度避免图标切换抖动 */
     .play-toggle {
       min-width: 98px;
@@ -926,6 +973,9 @@
         <div class="export-area" id="exportArea">
           <button data-action="export-video" title="导出为 WebM 视频">📽 导出视频</button>
           <button data-action="export-card" title="导出为 PNG 纪念卡">🎴 导出纪念卡</button>
+          <button id="midiBtn" title="把这段生长音乐导出成标准 MIDI 文件（可拖进任意 DAW / 打谱软件）">🎹 导出 MIDI</button>
+          <button id="musicBtn" class="music-btn" title="生长音乐：每个提交对应一个音（快捷键 M）">🔇 音乐关</button>
+          <button id="qualityBtn" class="quality-btn" title="画质档位：掉帧时会自动降档，也可以手动切换">✨ 高画质</button>
         </div>
         <a href="https://github.com/dongfangzhizhu/gittree" target="_blank" rel="noopener">GitHub ↗</a>
       </div>

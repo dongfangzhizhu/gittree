@@ -18,6 +18,11 @@ import { SceneBranch } from "./scene-types";
 export const RINGS_PER_SEGMENT = 6;
 /** 每环径向分段数（测试按此步长定位环上顶点） */
 export const RADIAL_SEGMENTS = 12;
+/**
+ * 树皮贴图对应的世界尺寸：UV 按「弧长 / 该值」与「周长 / 该值」铺开，
+ * 使粗树干与细枝上的树皮纹理密度一致（ez-tree 的 UV 技巧）。
+ */
+export const BARK_TILE_WORLD = 90;
 
 export interface BranchGeometryResult {
   geometry: THREE.BufferGeometry;
@@ -59,8 +64,10 @@ export function buildBranchGeometry(branch: SceneBranch): BranchGeometryResult {
   const radial = RADIAL_SEGMENTS;
 
   const positions: number[] = [];
+  const uvs: number[] = [];
   const indices: number[] = [];
   const ringBirths: number[] = [];
+  const curveLength = Math.max(1e-3, curve.getLength());
 
   // 平行传输标架
   let normal = new THREE.Vector3();
@@ -108,6 +115,8 @@ export function buildBranchGeometry(branch: SceneBranch): BranchGeometryResult {
       const vy = pos.y + radius * (normal.y * cos + binormal.y * sin);
       const vz = pos.z + radius * (normal.z * cos + binormal.z * sin);
       positions.push(vx, vy, vz);
+      // UV：横向按周长归一，纵向按弧长归一 → 粗树干与细枝的树皮密度一致
+      uvs.push(((j / radial) * Math.PI * 2 * radius) / BARK_TILE_WORLD, (u * curveLength) / BARK_TILE_WORLD);
     }
   }
 
@@ -127,9 +136,11 @@ export function buildBranchGeometry(branch: SceneBranch): BranchGeometryResult {
   const baseCenterIndex = positions.length / 3;
   const basePos = curve.getPoint(0);
   positions.push(basePos.x, basePos.y, basePos.z);
+  uvs.push(0.5, 0);
   const tipCenterIndex = positions.length / 3;
   const tipPos = curve.getPoint(1);
   positions.push(tipPos.x, tipPos.y, tipPos.z);
+  uvs.push(0.5, curveLength / BARK_TILE_WORLD);
 
   for (let j = 0; j < radial; j++) {
     // 根部：法线朝向 −切线，环形绕序反向
@@ -143,6 +154,7 @@ export function buildBranchGeometry(branch: SceneBranch): BranchGeometryResult {
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
   geometry.computeBoundingSphere();

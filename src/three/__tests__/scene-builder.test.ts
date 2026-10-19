@@ -98,9 +98,10 @@ describe("buildScene", () => {
     const scene = buildScene(model, { seed: "s" });
     const nonMerge = model.commits.filter((c) => !c.isMerge);
     // 叶簇：一个提交对应多片叶子（LEAVES_PER_CLUSTER），主叶 id 为 leaf-<idx>
+    const commitLeaves = scene.leaves.filter((l) => /^leaf-\d+(-\d+)?$/.test(l.id));
+    expect(commitLeaves.length).toBe(nonMerge.length * 15);
     expect(scene.leaves.length).toBeGreaterThanOrEqual(nonMerge.length);
-    expect(scene.leaves.length % nonMerge.length).toBe(0);
-    const leafedCommits = new Set(scene.leaves.map((l) => l.commitId));
+    const leafedCommits = new Set(commitLeaves.map((l) => l.commitId));
     expect(leafedCommits.size).toBe(nonMerge.length);
     for (const commit of nonMerge) expect(leafedCommits.has(commit.id)).toBe(true);
 
@@ -108,8 +109,52 @@ describe("buildScene", () => {
     expect(specLeaf?.shape).toBe("purple");
     expect(specLeaf?.colorIndex).toBe(12); // LEAF_COLOR_KIRO
     // 同一提交的叶子共享落叶时刻（整簇一起飘落）
-    const cluster = scene.leaves.filter((l) => l.commitId === "s1");
+    const cluster = commitLeaves.filter((l) => l.commitId === "s1");
     expect(new Set(cluster.map((l) => String(l.fallAt))).size).toBe(1);
+  });
+
+  it("细分枝：主干与大枝都会长出次级细枝，且梢头挂叶", () => {
+    const scene = buildScene(buildTestModel(), { seed: "s" });
+    // 细分枝是独立的连续枝干（每条 4 个折线点）
+    const twigs = scene.branches.filter((b) => b.kind === "twig");
+    expect(twigs.length).toBeGreaterThan(4);
+
+    // 每根细分枝都有出生窗口，且严格升序、落在 [0,1]
+    for (const twig of twigs) {
+      expect(twig.births.length).toBe(twig.points.length - 1);
+      let prev = -1;
+      for (const [b0, b1] of twig.births) {
+        expect(b0).toBeGreaterThanOrEqual(prev);
+        expect(b1).toBeGreaterThan(b0);
+        expect(b1).toBeLessThanOrEqual(1);
+        prev = b0;
+      }
+      // 锥度：半径单调收缩
+      for (let i = 1; i < twig.radii.length; i++) {
+        expect(twig.radii[i]).toBeLessThan(twig.radii[i - 1]);
+      }
+    }
+
+    // 细分枝叶簇：id 前缀 leaf-twig-，数量比提交叶簇少
+    const twigLeaves = scene.leaves.filter((l) => /^leaf-twig-\d+(-\d+)?$/.test(l.id));
+    expect(twigLeaves.length).toBeGreaterThan(0);
+    expect(twigLeaves.length % 7).toBe(0);
+    // 填充叶簇：沿细分枝补的装饰叶
+    const fillLeaves = scene.leaves.filter((l) => /^leaf-fill-\d+(-\d+)?$/.test(l.id));
+    expect(fillLeaves.length).toBeGreaterThan(0);
+    expect(fillLeaves.length % 8).toBe(0);
+    // 叶簇中心贴在细分枝梢头附近
+    for (const leaf of twigLeaves) {
+      expect(leaf.birth).toBeGreaterThan(0);
+      expect(leaf.birth).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("细分枝是确定性的：同一 seed 两次生成完全一致", () => {
+    const a = buildScene(buildTestModel(), { seed: "s" });
+    const b = buildScene(buildTestModel(), { seed: "s" });
+    expect(a.branches).toEqual(b.branches);
+    expect(a.leaves).toEqual(b.leaves);
   });
 
   it("果实包含全部标签；主版本标记为 major", () => {

@@ -16,6 +16,7 @@ import {
   SceneFruit,
   Vec3,
 } from "./scene-types";
+import { growTwigs, TwigParent, TwigTip, samplePolyline, sampleBirth } from "./twig-builder";
 
 /** 布局常量（与 FR-TL-02/03/04/06 对应，世界单位） */
 const MAX_RISE = 820; // 树冒高度上限
@@ -26,7 +27,23 @@ const BRANCH_DEPTH_FLATTEN_DEG = 9;
 /** 一级枝的伸展长度基准 = 树高 × 该系数（决定冠幅） */
 const LIMB_LEN_RATIO = 0.55;
 /** 每个提交长出的叶子数量（叶簇：单片叶太稀，看不出树冠） */
-const LEAVES_PER_CLUSTER = 9;
+const LEAVES_PER_CLUSTER = 15;
+/** 单棵树的叶片预算：提交多的仓库按比例稀释，避免森林模式几万片叶子拖垮帧率 */
+const LEAF_BUDGET_PER_TREE = 3000;
+/** 细分枝梢头的叶簇数量（比提交叶簇小，只做填充） */
+const LEAVES_PER_TWIG = 7;
+/** 沿细分枝补的装饰叶簇每团数量 */
+const LEAVES_PER_FILL = 8;
+/** 主干上最多长多少根细分枝 */
+const MAX_TRUNK_TWIGS = 14;
+/** 每条大枝上最多长多少根细分枝 */
+const MAX_LIMB_TWIGS = 2;
+/**
+ * 每棵树的细分枝总预算。
+ * 每根细枝是一根独立管网格 = 一个 draw call，lane 很多的仓库
+ * （几十条分支 × 每条几根）会把 draw call 推到上千，必须封顶。
+ */
+const TWIG_BUDGET_PER_TREE = 48;
 /** 黄金角：让枝条绕主干均匀铺开，而不是挤在同一侧 */
 const GOLDEN_ANGLE = 2.399963229728653;
 const THICKNESS = { base: 2.2, min: 1.5, max: 30, basalFlare: 1.1, flareDecay: 50 };
@@ -81,6 +98,8 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
   const commitCount = commits.length;
   const commitById = new Map(commits.map((c) => [c.id, c]));
   const commitIndex = new Map(commits.map((c, i) => [c.id, i]));
+  /** 作者名 → 叶色索引 */
+  const authorColorByName = new Map(model.authors.map((a) => [a.name, a.colorIndex]));
 
   /** 提交序号 → 动画时间 t（按序号均匀分配） */
   const tOf = (idx: number): number =>
@@ -208,6 +227,11 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     .filter((it) => it.laneCommits.length > 0)
     // 父枝先建，子枝才能挂到父枝的梢部
     .sort((a, b) => a.depth - b.depth || a.lane.id - b.lane.id);
+
+  /** laneId → 该 lane 的提交（细分枝按提交密度决定数量） */
+  const laneCommitsByLane = new Map(limbLanes.map((it) => [it.lane.id, it.laneCommits]));
+  /** 已建成的大枝（细分枝的父枝） */
+  const limbBranches: SceneBranch[] = [];
 
   /** 树冠包络半径：枝条末端不得超出，否则冠幅会失控 */
   const crownRadius = MAX_RISE * 0.58;
@@ -337,19 +361,138 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     });
 
     if (branchBirths.length > 0) {
-      branches.push({
+      const entry: SceneBranch = {
         laneId: lane.id,
         kind: "branch",
         points: branchPoints,
         radii: branchRadii,
         births: branchBirths,
-      });
+      };
+      branches.push(entry);
+      limbBranches.push(entry);
     }
+  }
+
+  // ==================== 2.5) 细分枝 ====================
+  // git lane 只决定「大枝」的走势；真实树冠的层次感来自枝身上的次级细枝
+  // （ez-tree 的递归分支：队列 + children/angle/gnarliness/taper）。
+  // 这里在主干和每条大枝上长出细枝，细枝上再长一层细枝（递归两级），
+  // 纯装饰、不映射提交，但出生时刻跟随父枝——看起来是「跟着大枝一起长出来的」。
+  const twigTips: TwigTip[] = [];
+  /**
+   * 叶簇锚点：细分枝上的采样点（不含梢头）。
+   * 主干的提交没有自己的枝可挂叶，就撒到这些锚点上——
+   * 否则所有叶子会挤在一根大枝上，树冠变成一片「扇子」而不是一个体积。
+   */
+  const foliageAnchors: Array<{ pos: Vec3; birth: number }> = [];
+  /**
+   * 填充叶簇：沿细分枝再撒几团装饰叶（ez-tree 的 leaves.count / start）。
+   * 它们不新增提交语义，颜色/形状沿用所挂提交，纯粹补树冠的密度——
+   * 只有「提交叶」时树冠会像早春的疏枝，加填充叶才有盛夏的浓密感。
+   */
+  const fillClusters: Array<{ center: Vec3; birth: number; commitId: string; seedKey: string }> = [];
+
+  /** 本棵树剩余的细分枝配额 */
+  let twigBudget = TWIG_BUDGET_PER_TREE;
+
+  /** 给一根父枝长细分枝，并把梢头/锚点收进来供后续挂叶 */
+  const sprout = (
+    parent: TwigParent,
+    twigCount: number,
+    uRange: [number, number],
+    depth: number,
+    parentCommitIds?: string[]
+  ) => {
+    // 配额耗尽就不再长（draw call 封顶）
+    const count = Math.max(0, Math.min(twigCount, twigBudget));
+    if (count === 0) return;
+    twigBudget -= count;
+
+    const res = growTwigs(parent, {
+      seed,
+      twigCount: count,
+      uRange,
+      parentCommitIds,
+    });
+    branches.push(...res.branches);
+    twigTips.push(...res.tips);
+
+    res.branches.forEach((twig, ti) => {
+      // 每根细枝取 4 个锚点（避开梢头，梢头由 twigTips 单独挂叶）
+      for (const u of [0.12, 0.38, 0.64, 0.86]) {
+        foliageAnchors.push({ pos: samplePolyline(twig.points, u), birth: sampleBirth(twig.births, u) });
+      }
+      // 沿细枝再补两团填充叶
+      const tipInfo = res.tips[ti];
+      for (const u of [0.32, 0.66]) {
+        fillClusters.push({
+          center: samplePolyline(twig.points, u),
+          birth: sampleBirth(twig.births, u),
+          commitId: tipInfo?.commitId ?? parentCommitIds?.[0] ?? "",
+          seedKey: `${seed}:fill:${parent.laneId}:${depth}:${ti}:${u}`,
+        });
+      }
+
+      // 递归下一层：只在主干细枝上再分一根（大枝本身已经够密，且要吃配额）
+      if (depth === 0 && twigBudget > 0 && twig.points.length >= 2) {
+        twigBudget -= 1;
+        const sub = growTwigs(twig, {
+          seed: `${seed}:sub`,
+          twigCount: 1,
+          uRange: [0.55, 0.78],
+          parentCommitIds,
+        });
+        branches.push(...sub.branches);
+        twigTips.push(...sub.tips);
+        sub.branches.forEach((s) => {
+          foliageAnchors.push({
+            pos: samplePolyline(s.points, 0.8),
+            birth: sampleBirth(s.births, 0.8),
+          });
+          fillClusters.push({
+            center: samplePolyline(s.points, 0.6),
+            birth: sampleBirth(s.births, 0.6),
+            commitId: parentCommitIds?.[0] ?? "",
+            seedKey: `${seed}:fill2:${parent.laneId}:${ti}`,
+          });
+        });
+      }
+    });
+  };
+
+  // 主干细枝：数量随主干提交数增长；树根附近留干净，只在上部 26%–98% 出枝
+  if (trunkPoints.length >= 2) {
+    const twigCount = Math.min(MAX_TRUNK_TWIGS, Math.max(4, Math.round(trunkCommits.length / 6)));
+    sprout(
+      {
+        points: trunkPoints,
+        radii: trunkRadii,
+        births: trunkBirths,
+        laneId: trunkLane.id,
+        kind: "trunk",
+      },
+      twigCount,
+      [0.26, 0.98],
+      0,
+      trunkCommits.map((c) => c.id)
+    );
+  }
+
+  // 大枝细枝：短枝也至少给 2 根，否则光杆一条
+  for (const entry of limbBranches) {
+    const laneCommits = laneCommitsByLane.get(entry.laneId);
+    if (!laneCommits) continue;
+    const twigCount = Math.min(MAX_LIMB_TWIGS, Math.max(2, Math.round(laneCommits.length / 5)));
+    sprout(entry, twigCount, [0.22, 0.92], 1, laneCommits.map((c) => c.id));
   }
 
   // 叶子：每个非 merge 提交（FR-TL-07）
   const trunkCommitIds = new Set(trunkCommits.map((c) => c.id));
-  const authorColorByName = new Map(model.authors.map((a) => [a.name, a.colorIndex]));
+  // 提交越多，每簇叶子越少（总叶片数收敛到预算内）——大仓库靠枝干本身撑体量
+  const leavesPerCluster = Math.max(
+    4,
+    Math.min(LEAVES_PER_CLUSTER, Math.round(LEAF_BUDGET_PER_TREE / Math.max(1, commitCount)))
+  );
   const dormancyThreshold =
     commitCount >= 2
       ? Math.max(
@@ -371,8 +514,19 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     const outX = radial > 1e-3 ? tip[0] / radial : Math.cos(idx * GOLDEN_ANGLE);
     const outZ = radial > 1e-3 ? tip[2] / radial : Math.sin(idx * GOLDEN_ANGLE);
     let center: Vec3;
-    if (trunkCommitIds.has(commit.id) && limbArcs.length > 0) {
-      // 主干上没有枝条，叶簇挂到高度最接近的那根枝条上——叶子绝不能悬在半空
+    let birth = t1;
+    if (trunkCommitIds.has(commit.id) && foliageAnchors.length > 0) {
+      // 主干上的提交：撒到细分枝锚点上，把树冠填成体积而不是一片扇子。
+      // 锚点按序号错开取（idx*5+3 与锚点数互质的概率高，分布均匀），
+      // 出生时刻取「提交时刻」与「细枝长到该处」的较晚者——叶子绝不悬空。
+      const a = foliageAnchors[(idx * 5 + 3) % foliageAnchors.length];
+      const jx = (seededRandom(`${seed}:anchor:${commit.id}`, 1) * 2 - 1) * 9;
+      const jy = (seededRandom(`${seed}:anchor:${commit.id}`, 2) * 2 - 1) * 7;
+      const jz = (seededRandom(`${seed}:anchor:${commit.id}`, 3) * 2 - 1) * 9;
+      center = [a.pos[0] + jx, a.pos[1] + jy + 2, a.pos[2] + jz];
+      birth = Math.max(t1, a.birth);
+    } else if (trunkCommitIds.has(commit.id) && limbArcs.length > 0) {
+      // 没有细分枝可挂（极短历史）：退回挂到高度最接近的那根大枝上
       let best = limbArcs[0];
       for (const arc of limbArcs) {
         if (Math.abs(arc.attachY - tip[1]) < Math.abs(best.attachY - tip[1])) best = arc;
@@ -401,40 +555,65 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     }
 
     // 一簇叶子：k=0 为主叶（信息面板定位锚点），其余散布成叶团
-    for (let k = 0; k < LEAVES_PER_CLUSTER; k++) {
-      const r1 = seededRandom(`${seed}:${commit.id}:${k}`, 11);
-      const r2 = seededRandom(`${seed}:${commit.id}:${k}`, 12);
-      const r3 = seededRandom(`${seed}:${commit.id}:${k}`, 13);
-      const r4 = seededRandom(`${seed}:${commit.id}:${k}`, 14);
-      const dist = 3 + r1 * 9;
-      const theta = Math.acos(1 - r2 * 0.85); // 偏向上半球
-      const phi = k * GOLDEN_ANGLE + r3 * Math.PI;
-      const pos: Vec3 =
-        k === 0
-          ? center
-          : [
-              center[0] + Math.cos(phi) * Math.sin(theta) * dist,
-              center[1] + Math.cos(theta) * dist * 0.85,
-              center[2] + Math.sin(phi) * Math.sin(theta) * dist,
-            ];
+    emitLeafCluster(leaves, {
+      center,
+      seedKey: `${seed}:${commit.id}`,
+      count: leavesPerCluster,
+      sizeScale: 1,
+      sizeBase: leafSizeOf(commit),
+      birth,
+      colorIndex,
+      shape: leafShapeOf(commit),
+      commitId: commit.id,
+      idPrefix: `leaf-${idx}`,
+      fallAt,
+    });
+  });
 
-      leaves.push({
-        id: k === 0 ? `leaf-${idx}` : `leaf-${idx}-${k}`,
-        commitId: commit.id,
-        pos,
-        size: leafSizeOf(commit) * (k === 0 ? 1 : 0.72 + r4 * 0.42),
-        shape: leafShapeOf(commit),
-        colorIndex,
-        birth: t1,
-        fallAt,
-        phase: (pos[0] + pos[1] + pos[2]) * 0.01,
-        axis: vNorm([
-          seededRandom(`${seed}:${commit.id}:${k}`, 6) * 2 - 1,
-          seededRandom(`${seed}:${commit.id}:${k}`, 7) * 2 - 1,
-          seededRandom(`${seed}:${commit.id}:${k}`, 8) * 2 - 1,
-        ]),
-      });
-    }
+  // 细分枝梢头的叶簇：让次级细枝也有叶子，树冠才茂盛
+  twigTips.forEach((tip, i) => {
+    const commit = tip.commitId ? commitById.get(tip.commitId) : undefined;
+    const typeColor = commit?.type === "spec" || commit?.type === "hook";
+    const colorIndex = typeColor
+      ? LEAF_COLOR_KIRO
+      : commit
+        ? authorColorByName.get(commit.author.name) ?? 11
+        : 11;
+    emitLeafCluster(leaves, {
+      center: [tip.pos[0], tip.pos[1] + 3, tip.pos[2]],
+      seedKey: `${seed}:twigleaf:${i}`,
+      count: LEAVES_PER_TWIG,
+      sizeScale: 0.62 + Math.min(0.3, tip.radius * 0.06),
+      sizeBase: commit ? leafSizeOf(commit) : 1.2,
+      birth: tip.birth,
+      colorIndex,
+      shape: commit ? leafShapeOf(commit) : "circle",
+      commitId: tip.commitId ?? "",
+      idPrefix: `leaf-twig-${i}`,
+    });
+  });
+
+  // 填充叶簇：沿细分枝补的装饰叶，把树冠从「疏枝」补成「浓荫」
+  fillClusters.forEach((fc, i) => {
+    const commit = fc.commitId ? commitById.get(fc.commitId) : undefined;
+    const typeColor = commit?.type === "spec" || commit?.type === "hook";
+    const colorIndex = typeColor
+      ? LEAF_COLOR_KIRO
+      : commit
+        ? authorColorByName.get(commit.author.name) ?? 11
+        : 11;
+    emitLeafCluster(leaves, {
+      center: fc.center,
+      seedKey: fc.seedKey,
+      count: LEAVES_PER_FILL,
+      sizeScale: 0.68,
+      sizeBase: commit ? leafSizeOf(commit) : 1.2,
+      birth: fc.birth,
+      colorIndex,
+      shape: commit ? leafShapeOf(commit) : "circle",
+      commitId: fc.commitId,
+      idPrefix: `leaf-fill-${i}`,
+    });
   });
 
   // 果实：标签（FR-TL-07 的三维版）
@@ -529,6 +708,13 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
     height = Math.max(height, seg.p1[1]);
     radius = Math.max(radius, Math.hypot(seg.p1[0], seg.p1[2]));
   }
+  // 细分枝也是实体，梢头可能伸出大枝包络之外
+  for (const branch of branches) {
+    for (const p of branch.points) {
+      height = Math.max(height, p[1]);
+      radius = Math.max(radius, Math.hypot(p[0], p[2]));
+    }
+  }
   for (const leaf of leaves) {
     height = Math.max(height, leaf.pos[1]);
     radius = Math.max(radius, Math.hypot(leaf.pos[0], leaf.pos[2]));
@@ -549,6 +735,64 @@ export function buildScene(model: GrowthModel, options: SceneOptions = {}): Thre
 
 function clamp(v: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, v));
+}
+
+/** 叶簇参数（提交叶与细分枝叶共用，保证两者的形态规则一致） */
+interface LeafClusterSpec {
+  center: Vec3;
+  seedKey: string;
+  count: number;
+  /** 相对该提交类型基础尺寸的缩放 */
+  sizeScale: number;
+  sizeBase: number;
+  birth: number;
+  colorIndex: number;
+  shape: string;
+  commitId: string;
+  /** 叶子 id 前缀；k=0 为主叶（信息面板定位锚点） */
+  idPrefix: string;
+  fallAt?: number;
+}
+
+/**
+ * 在 center 周围撒一簇叶子：k=0 为主叶（信息面板定位锚点），
+ * 其余按黄金角 + 偏上半球散布成叶团。
+ */
+function emitLeafCluster(leaves: SceneLeaf[], spec: LeafClusterSpec): void {
+  for (let k = 0; k < spec.count; k++) {
+    const r1 = seededRandom(`${spec.seedKey}:${k}`, 11);
+    const r2 = seededRandom(`${spec.seedKey}:${k}`, 12);
+    const r3 = seededRandom(`${spec.seedKey}:${k}`, 13);
+    const r4 = seededRandom(`${spec.seedKey}:${k}`, 14);
+    const spread = 4 + r1 * 16;
+    const theta = Math.acos(1 - r2 * 0.85); // 偏向上半球
+    const phi = k * GOLDEN_ANGLE + r3 * Math.PI;
+    const pos: Vec3 =
+      k === 0
+        ? spec.center
+        : [
+            spec.center[0] + Math.cos(phi) * Math.sin(theta) * spread,
+            spec.center[1] + Math.cos(theta) * spread * 0.85,
+            spec.center[2] + Math.sin(phi) * Math.sin(theta) * spread,
+          ];
+
+    leaves.push({
+      id: k === 0 ? spec.idPrefix : `${spec.idPrefix}-${k}`,
+      commitId: spec.commitId,
+      pos,
+      size: spec.sizeBase * spec.sizeScale * (k === 0 ? 1 : 0.72 + r4 * 0.42),
+      shape: spec.shape,
+      colorIndex: spec.colorIndex,
+      birth: spec.birth,
+      fallAt: spec.fallAt,
+      phase: (pos[0] + pos[1] + pos[2]) * 0.01,
+      axis: vNorm([
+        seededRandom(`${spec.seedKey}:${k}`, 6) * 2 - 1,
+        seededRandom(`${spec.seedKey}:${k}`, 7) * 2 - 1,
+        seededRandom(`${spec.seedKey}:${k}`, 8) * 2 - 1,
+      ]),
+    });
+  }
 }
 
 /**

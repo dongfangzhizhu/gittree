@@ -64,7 +64,7 @@ export interface SceneFruit {
 /** 一条枝干的连续折线（渲染时生成单根管状网格，避免逐段拼接的接缝） */
 export interface SceneBranch {
   laneId: number;
-  kind: "trunk" | "branch";
+  kind: "trunk" | "branch" | "twig";
   /** 折线点（根 → 梢），长度 = 段数 + 1 */
   points: Vec3[];
   /** 每个点的半径（与 points 等长，锥度连续） */
